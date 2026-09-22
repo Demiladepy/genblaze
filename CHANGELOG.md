@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new user; updated to the catalog-listed `imagen-4.0-*` slugs, documented
   the entitlement caveat, and documented the previously-unlisted
   `GeminiImageProvider` as the no-entitlement alternative (#233).
+- **Fixed** `chat()`/`achat()` with `retry_on_rate_limit=True` (or
+  `retry_policy=`) now retries a Gemini `503 UNAVAILABLE` / model-overloaded
+  error under the same backoff as a 429 instead of failing on the first
+  attempt. Requires the genblaze-core release carrying this fix (#264).
 
 ### genblaze-core
 
@@ -107,6 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ModuleNotFoundError: No module named 'pytest'` on a clean
   `pip install genblaze-core`. `pytest` is now imported inside the four
   compliance-harness methods that use it (P1-01).
+- **Changed** `call_with_rate_limit_retry` (behind the `retry_on_rate_limit=`
+  flag on the `chat()` helpers) now retries `SERVER_ERROR` (5xx, e.g. Gemini
+  `503 UNAVAILABLE`) as well as `RATE_LIMIT` by default, and honors an explicit
+  `RetryPolicy`'s full `retryable_codes` — matching `BaseProvider`'s poll/fetch
+  path. `TIMEOUT` retries only via an explicit policy, since a timed-out long
+  generation can still be billed; callers already passing an explicit
+  `RetryPolicy()` now retry `TIMEOUT` too. Pass
+  `RetryPolicy(retryable_codes=frozenset({ProviderErrorCode.RATE_LIMIT}))` for
+  the previous 429-only behavior (#264).
 - **Added** public ffmpeg helpers behind `FFmpegCompositor` / `FFmpegTransform`
   for custom deterministic providers:
   `from genblaze_core.providers import resolve_ffmpeg, resolve_input_path,
@@ -188,6 +201,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   application/octet-stream` instead of the source's real type. The suffix
   is now derived from the input `Asset.media_type` (falling back to `.png`)
   (#253).
+- **Fixed** `chat()`/`achat()` with `retry_on_rate_limit=True` (or
+  `retry_policy=`) now also retries 5xx, which previously failed fast because
+  opting in disables the OpenAI SDK's own retry. Requires the genblaze-core
+  release carrying this fix (#264).
 - **Fixed** `DalleProvider.generate()` dropped the `usage` block on
   `gpt-image-*` responses, leaving `Step.provider_payload` empty and no way
   to reconcile actual token-based cost against the registry's pre-flight
