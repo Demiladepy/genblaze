@@ -51,23 +51,22 @@ assert manifest.verify_hash()
 
 **What it proves:** Mode 1 + only the holder of a specific signing key could have produced the manifest.
 
-**Mechanism:** Optional `genblaze_core.signing` module with `Ed25519Signer` (requires `pip install 'genblaze-core[signing]'`). Signs canonical manifest JSON (excluding `signature`, `manifest_uri`, `encryption_scheme`). Store the JSON bundle in `Manifest.signature`.
+**Mechanism:** Optional `genblaze_core.signing` module with `Ed25519Signer` (requires `pip install 'genblaze-core[signing]'`). Signs `manifest.canonical_hash` — recomputed through the same canonical-hash machinery `Manifest.verify_hash()` uses, not a separate serialization — so a signature can never drift from what Mode 1 already commits to. Store the JSON bundle in `Manifest.signature`.
 
-**When you'd want it:** Multi-tenant SaaS attribution, brand publishing, EU AI Act Article 50 compliance pipelines (see [ATTEST](https://github.com/backblaze-labs/genblaze/discussions)).
+**When you'd want it:** Multi-tenant SaaS attribution, brand publishing, EU AI Act Article 50 compliance pipelines (see [ATTEST](https://github.com/Demiladepy/attest)).
 
-**Status:** Implemented behind optional extra in ATTEST upstream PR. API surface:
+**Status:** Experimental — ships behind the optional `signing` extra; API surface may still change before it's declared stable. API surface:
 
 ```python
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from genblaze_core import Manifest
 from genblaze_core.signing import Ed25519Signer, verify_signature_bundle
 
 signer = Ed25519Signer.from_env("GENBLAZE_SIGNING_KEY_HEX")
 manifest = Manifest.from_run(run)
-payload = manifest.model_dump(mode="python")
-bundle = signer.sign_manifest(payload, signed_at=datetime.now(timezone.utc).isoformat())
+bundle = signer.sign_manifest(manifest, signed_at=datetime.now(UTC).isoformat())
 manifest.signature = bundle.to_json()
-assert verify_signature_bundle(payload, bundle)
+assert verify_signature_bundle(manifest, bundle)
 ```
 
 ### Mode 3 — Standards-verifiable (roadmap, opt-in)

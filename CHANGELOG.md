@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- Add new entries here. -->
 
+### genblaze-core
+
+- **Added (experimental)** Trust Mode 2 authenticated integrity: an optional
+  `genblaze_core.signing` module (`pip install "genblaze-core[signing]"`)
+  with an `Ed25519Signer` that signs a manifest's existing `canonical_hash`
+  and a `verify_signature_bundle()` verifier. API surface may still change
+  before this is declared stable. Thanks to @Demiladepy for the original
+  contribution.
+
 ## [0.4.0] - 2026-06-25
 
 Security hardening (SSRF, URL-only asset verification), two new providers
