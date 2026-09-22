@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import html
 import json
+import os
 from pathlib import Path
 
 from PIL import Image
 
 from genblaze_core.exceptions import EmbeddingError
-from genblaze_core.media.base import BaseMediaHandler, MediaCapability, atomic_write
+from genblaze_core.media.base import (
+    BaseMediaHandler,
+    MediaCapability,
+    atomic_write,
+    read_media_bytes,
+)
 from genblaze_core.models.manifest import Manifest, parse_manifest
 
 XMP_NS = "genblaze"
@@ -92,9 +98,17 @@ def _scan_xmp_for_manifest(data: bytes, source: Path) -> str:
 class JpegHandler(BaseMediaHandler):
     """Embed and extract manifests in JPEG XMP metadata."""
 
-    def embed(self, source: Path, manifest: Manifest, output: Path | None = None) -> Path:
-        output = output or source
+    def embed(
+        self,
+        source: str | os.PathLike[str],
+        manifest: Manifest,
+        output: str | os.PathLike[str] | None = None,
+    ) -> Path:
         try:
+            # Coerce both source= and output= — either being a bare str
+            # would leak into the -> Path contract below (#225).
+            source = Path(source)
+            output = Path(output) if output else source
             manifest_json = manifest.to_canonical_json()
             xmp_data = _build_xmp(manifest_json)
             if len(xmp_data) > MAX_XMP_BYTES:
@@ -121,10 +135,10 @@ class JpegHandler(BaseMediaHandler):
         except Exception as exc:
             raise EmbeddingError(f"Failed to embed manifest in JPEG: {exc}") from exc
 
-    def extract(self, source: Path) -> Manifest:
+    def extract(self, source: str | os.PathLike[str]) -> Manifest:
         try:
-            with open(source, "rb") as f:
-                data = f.read()
+            source = Path(source)
+            data = read_media_bytes(source)
             manifest_json = _scan_xmp_for_manifest(data, source)
             return parse_manifest(json.loads(manifest_json))
         except EmbeddingError:

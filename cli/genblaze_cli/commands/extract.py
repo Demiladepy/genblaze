@@ -20,14 +20,25 @@ def _manifest_json_for_display(manifest: Manifest) -> str:
 
 
 @click.command()
-@click.argument("file", type=click.Path(exists=True, path_type=Path))
+@click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--format", "fmt", type=click.Choice(["json", "summary"]), default="json")
-def extract(file: Path, fmt: str) -> None:
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write extracted manifest JSON to this file instead of stdout.",
+)
+def extract(file: Path, fmt: str, output: Path | None) -> None:
     """Extract and display the genblaze manifest from a media file."""
     try:
         manifest = extract_manifest(file)
         if fmt == "json":
-            click.echo(_manifest_json_for_display(manifest))
+            json_str = _manifest_json_for_display(manifest)
+            if output is not None:
+                output.write_text(json_str, encoding="utf-8")
+            else:
+                click.echo(json_str)
         else:
             report = manifest.verification_report()
             click.echo(f"Run ID:    {manifest.run.run_id}")
@@ -35,6 +46,9 @@ def extract(file: Path, fmt: str) -> None:
             click.echo(f"Hash:      {manifest.canonical_hash}")
             click.echo(f"Hash OK:   {report.hash_ok}")
             click.echo(f"Output sha256: {len(report.unverified_sha256_ids)} missing or malformed")
+            # Itemize metadata too, so a False `Verified:` line always has a
+            # visible reason (report.ok folds in invalid_metadata_ids, #149).
+            click.echo(f"Output metadata: {len(report.invalid_metadata_ids)} out of spec")
             click.echo(f"Verified:  {report.ok} (asset bytes were not fetched or compared)")
     except Exception as exc:
         raise click.ClickException(f"{type(exc).__name__}: {exc}") from exc

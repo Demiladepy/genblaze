@@ -77,6 +77,17 @@ class TestAudioFamilyResolution:
         assert match.spec.extras.get("is_music") is True
         assert match.spec.model_id == "minimax-music-2.5"
 
+    def test_music_family_allowlists_lyrics_aliased_from_prompt(self) -> None:
+        """#251: GMI's music endpoint requires ``lyrics``, not ``prompt`` —
+        the allowlist must carry it and ``prompt`` must alias onto it, or
+        every music request 400s with "lyrics (Required parameter is
+        missing)" before it ever reaches GMI's servers."""
+        provider = GMICloudAudioProvider(api_key="test")
+        match = provider._models.match_family("MiniMax-Music-2.5")
+        assert match is not None
+        assert "lyrics" in (match.spec.param_allowlist or set())
+        assert match.spec.param_aliases.get("prompt") == "lyrics"
+
     def test_tts_routes_to_tts_family(self) -> None:
         provider = GMICloudAudioProvider(api_key="test")
         # Mix PascalCase + lowercase to prove both casings match.
@@ -89,6 +100,17 @@ class TestAudioFamilyResolution:
             assert match is not None, slug
             assert match.family.name == "gmi-audio-tts", slug
             assert match.spec.model_id == expected_wire, slug
+
+    def test_tts_family_allowlists_text_aliased_from_prompt(self) -> None:
+        """#251: GMI's TTS endpoint requires ``text``, not ``prompt`` —
+        the allowlist must carry it and ``prompt`` must alias onto it, or
+        every TTS request 400s with "text (Required parameter is missing)"
+        before it ever reaches GMI's servers."""
+        provider = GMICloudAudioProvider(api_key="test")
+        match = provider._models.match_family("minimax-tts-speech-2.6-turbo")
+        assert match is not None
+        assert "text" in (match.spec.param_allowlist or set())
+        assert match.spec.param_aliases.get("prompt") == "text"
 
 
 class TestImageFamilyResolution:
@@ -118,6 +140,19 @@ class TestImageFamilyResolution:
         provider = GMICloudImageProvider(api_key="test")
         match = provider._models.match_family("seedream-5.0-lite")
         assert match is None  # falls through to permissive fallback
+
+    def test_gpt_image_2_edit_routes_to_minimal_edit_family(self) -> None:
+        """#193 item 2: gpt-image-2-edit rejects the standard image surface
+        (aspect_ratio, number_of_images, etc.) with a generic 400 — the
+        dedicated family narrows the allowlist to prompt + image only."""
+        provider = GMICloudImageProvider(api_key="test")
+        match = provider._models.match_family("gpt-image-2-edit")
+        assert match is not None
+        assert match.family.name == "gmi-image-minimal-edit"
+        allowlist = match.spec.param_allowlist or set()
+        assert allowlist == {"prompt", "image", "image_url"}
+        assert "aspect_ratio" not in allowlist
+        assert "number_of_images" not in allowlist
 
 
 class TestVideoFamilyResolution:
@@ -156,12 +191,11 @@ class TestVideoFamilyResolution:
 
     def test_other_video_slugs_fall_through_to_fallback(self) -> None:
         """Slugs that don't match a specialized family (Pixverse, Wan-r2v,
-        Veo, Kling V2.1) fall through to the permissive fallback. The base
-        video surface (``cfg_scale`` alias, ``duration`` coercion) lives
-        on the fallback spec, not on a catch-all family."""
+        Veo, Kling V2.1, Seedance) fall through to the permissive fallback.
+        The base video surface (``cfg_scale`` alias, ``duration`` coercion)
+        lives on the fallback spec, not on a catch-all family."""
         provider = GMICloudVideoProvider(api_key="test")
         for slug in (
-            "seedance-1-0-pro-250528",
             "wan2.6-t2v",
             "luma-ray-2",
             # Newer Kling V2.5/V3 series uses lowercase; no dedicated
@@ -174,6 +208,24 @@ class TestVideoFamilyResolution:
             spec = provider._models.get(slug)
             assert "cfg_scale" in spec.param_aliases.values()
             assert "duration" in spec.param_coercers
+            assert "duration" in spec.param_schemas
+
+    def test_seedance_routes_to_seedance_family(self) -> None:
+        """Seedance (FLF2V + single-image I2V) gets its own family so
+        first/last-frame inputs map to GMI's documented ``first_frame`` /
+        ``last_frame`` slots instead of falling through to the fallback's
+        single ``image`` slot, which silently dropped the second frame
+        (#175)."""
+        provider = GMICloudVideoProvider(api_key="test")
+        for slug in ("seedance-2-0-260128", "seedance-1-0-pro-fast-251015"):
+            match = provider._models.match_family(slug)
+            assert match is not None, slug
+            assert match.family.name == "gmi-video-seedance", slug
+            allowlist = match.spec.param_allowlist or set()
+            assert "first_frame" in allowlist, slug
+            assert "last_frame" in allowlist, slug
+            # Same envelope convention as every other video family.
+            assert match.spec.extras.get("envelope_key") == "payload", slug
 
     def test_kling_v21_routes_to_dedicated_family(self) -> None:
         """Kling V2.1 (text2video + image2video) gets its own family
@@ -217,8 +269,8 @@ class TestUnstableExamples:
         """A slug that's neither in a family's ``unstable_examples`` nor
         in ``unstable_slugs`` should NOT carry the known_unstable detail."""
         provider = GMICloudVideoProvider(api_key="test")
-        # seedance — no family match, not in unstable_slugs
-        result = provider._models.validate("seedance-1-0-pro-250528")
+        # wan t2v — no family match, not in unstable_slugs
+        result = provider._models.validate("wan2.6-t2v")
         assert result.outcome is ValidationOutcome.UNKNOWN_PERMISSIVE
         assert "known_unstable" not in (result.detail or "")
         # Veo3 — matches Veo family (canonical PascalCase form)
@@ -308,12 +360,24 @@ class TestValidateModelEndToEnd:
         result = provider.validate_model("pixverse-v5.6-t2v")
         assert result.outcome is ValidationOutcome.OK_AUTHORITATIVE
 
-    def test_unknown_namespace_falls_through_permissive(self) -> None:
-        """A slug that doesn't match any family AND no probe attached
-        falls through to UNKNOWN_PERMISSIVE — preflight emits a one-time
-        WARN and proceeds."""
-        # Audio families don't cover lowercase slugs; this passes through.
+    def test_unknown_namespace_probed_via_fallback_probe(self) -> None:
+        """A slug that doesn't match any family is no longer a silent
+        UNKNOWN_PERMISSIVE — the registry's fallback_probe (#248) runs the
+        same empty-payload check the specialized families use, so a 404
+        grades NOT_FOUND instead of carrying no signal at all."""
+        # Audio families don't cover lowercase slugs; this used to pass
+        # through untouched. Now the fallback probe answers it.
         provider = _provider_with_probe_status(GMICloudAudioProvider, status=404)
+        result = provider.validate_model("totally-unknown-tts-slug")
+        assert result.outcome is ValidationOutcome.NOT_FOUND
+        assert result.source is ValidationSource.PROBE
+
+    def test_unknown_namespace_unknown_probe_status_stays_permissive(self) -> None:
+        """When the fallback probe itself can't tell (auth/rate-limit/5xx),
+        the unmatched slug still falls through to UNKNOWN_PERMISSIVE — the
+        fallback probe only sharpens the LIVE/DEAD cases, not the
+        already-inconclusive ones."""
+        provider = _provider_with_probe_status(GMICloudAudioProvider, status=500)
         result = provider.validate_model("totally-unknown-tts-slug")
         assert result.outcome is ValidationOutcome.UNKNOWN_PERMISSIVE
 
@@ -475,13 +539,23 @@ class TestPreflightOptOut:
 
 class TestUnstableSlugSurfaces:
     """0.3.2 cleanup: the only remaining ``unstable_slug`` is the orphan
-    ``vidu-q1`` (no family, registry-level). It surfaces as
-    ``UNKNOWN_PERMISSIVE`` + ``known_unstable`` via the fallback path —
-    there's no family probe to upgrade it to ``OK_AUTHORITATIVE``."""
+    ``vidu-q1`` (no family, registry-level). Since #248 wired a
+    ``fallback_probe`` onto the video registry, an orphan unstable slug is
+    now probed too — LIVE upgrades it to ``OK_AUTHORITATIVE`` while
+    preserving the ``known_unstable`` hint (ops still want the flag even
+    though the slug currently answers); DEAD would grade ``NOT_FOUND``."""
 
-    def test_orphan_unstable_slug_surfaces_known_unstable(self) -> None:
-        http = _http_with_status(400)  # LIVE — irrelevant; no family probe runs
+    def test_orphan_unstable_slug_live_preserves_known_unstable(self) -> None:
+        http = _http_with_status(400)  # LIVE via the fallback probe
         provider = GMICloudVideoProvider(api_key="test", http_client=http)
         result = provider.validate_model("vidu-q1")
-        assert result.outcome is ValidationOutcome.UNKNOWN_PERMISSIVE
+        assert result.outcome is ValidationOutcome.OK_AUTHORITATIVE
+        assert result.source is ValidationSource.PROBE
         assert "known_unstable" in (result.detail or "")
+
+    def test_orphan_unstable_slug_dead_not_found(self) -> None:
+        http = _http_with_status(404)  # DEAD via the fallback probe
+        provider = GMICloudVideoProvider(api_key="test", http_client=http)
+        result = provider.validate_model("vidu-q1")
+        assert result.outcome is ValidationOutcome.NOT_FOUND
+        assert result.source is ValidationSource.PROBE

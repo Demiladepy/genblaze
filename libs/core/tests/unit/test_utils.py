@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import socket
+from pathlib import PureWindowsPath
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 import pytest
 from genblaze_core._utils import (
+    _is_blocked_ip,
+    _normalize_ip,
     _run_async,
     check_ssrf,
     compute_sha256,
+    local_file_url,
     probe_audio_duration,
 )
 from genblaze_core.exceptions import StorageError
+from hypothesis import given
+from hypothesis import strategies as st
 
 # Fake DNS results for test control
 _PUBLIC_V4 = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
@@ -115,6 +123,75 @@ class TestCheckSsrf:
             with pytest.raises(ValueError, match="Private/loopback"):
                 check_ssrf("https://sneaky.example.com/path")
 
+    def test_nat64_imds_rejected(self):
+        """64:ff9b::a9fe:a9fe is the RFC 6052 NAT64 form of the IMDS address
+        169.254.169.254 (169=0xa9, 254=0xfe). ip.ipv4_mapped only recognizes
+        ::ffff:0:0/96, not the NAT64 well-known prefix, so this needs its
+        own extraction path."""
+        nat64_imds = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("64:ff9b::a9fe:a9fe", 0, 0, 0))
+        ]
+        with patch("genblaze_core._utils.socket.getaddrinfo", return_value=nat64_imds):
+            with pytest.raises(ValueError, match="Private/loopback"):
+                check_ssrf("https://sneaky.example.com/path")
+
+    def test_nat64_private_rejected(self):
+        """64:ff9b::0a00:0001 is the NAT64 form of 10.0.0.1."""
+        nat64_private = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("64:ff9b::0a00:0001", 0, 0, 0))
+        ]
+        with patch("genblaze_core._utils.socket.getaddrinfo", return_value=nat64_private):
+            with pytest.raises(ValueError, match="Private/loopback"):
+                check_ssrf("https://sneaky.example.com/path")
+
+    def test_nat64_public_allowed(self):
+        """NAT64 wrapping a genuinely public IPv4 address must still resolve —
+        the extraction path isn't a blanket rejection of the well-known prefix."""
+        nat64_public = [
+            # 93.184.216.34 = 0x5d.0xb8.0xd8.0x22
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("64:ff9b::5db8:d822", 0, 0, 0))
+        ]
+        with patch("genblaze_core._utils.socket.getaddrinfo", return_value=nat64_public):
+            check_ssrf("https://public.example.com/path")
+
+    def test_unspecified_ipv6_rejected(self):
+        """::/128 (the unspecified address) must be blocked."""
+        unspecified = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::", 0, 0, 0))]
+        with patch("genblaze_core._utils.socket.getaddrinfo", return_value=unspecified):
+            with pytest.raises(ValueError, match="Private/loopback"):
+                check_ssrf("https://sneaky.example.com/path")
+
+    def test_reserved_range_rejected_by_property_backstop(self):
+        """192.0.2.0/24 (TEST-NET-1, RFC 5737) isn't in the explicit
+        BLOCKED_NETWORKS list but is IETF-reserved; the is_reserved/is_private
+        property backstop must still catch ranges the explicit list misses."""
+        reserved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 0))]
+        with patch("genblaze_core._utils.socket.getaddrinfo", return_value=reserved):
+            with pytest.raises(ValueError, match="Private/loopback"):
+                check_ssrf("https://sneaky.example.com/path")
+
+
+class TestIsBlockedIpProperties:
+    """Property-based backstop for #16: no alternate representation of a
+    given IPv4 address (IPv4-mapped IPv6, NAT64) should have a different
+    blocked/allowed verdict than the plain address — that mismatch is
+    exactly the bypass class the issue describes."""
+
+    @given(st.ip_addresses(v=4))
+    def test_mapped_and_nat64_forms_match_plain_v4_verdict(self, v4):
+        plain_blocked = _is_blocked_ip(v4)
+
+        mapped_v6 = ipaddress.IPv6Address(f"::ffff:{v4}")
+        assert _is_blocked_ip(_normalize_ip(mapped_v6)) == plain_blocked
+
+        nat64_base = int(ipaddress.ip_network("64:ff9b::/96").network_address)
+        nat64_v6 = ipaddress.IPv6Address(nat64_base | int(v4))
+        assert _is_blocked_ip(_normalize_ip(nat64_v6)) == plain_blocked
+
+    @given(st.ip_addresses(v=4, network="10.0.0.0/8"))
+    def test_private_v4_range_always_blocked(self, v4):
+        assert _is_blocked_ip(_normalize_ip(v4)) is True
+
 
 class TestComputeSha256:
     def test_known_digest(self):
@@ -124,6 +201,66 @@ class TestComputeSha256:
     def test_empty_bytes(self):
         expected = hashlib.sha256(b"").hexdigest()
         assert compute_sha256(b"") == expected
+
+
+class TestLocalFileUrl:
+    """Regression for #164: connectors built file:// URLs with
+    f"file://{quote(str(path))}", which percent-encodes Windows drive
+    colons/backslashes into an unparseable URL. local_file_url() is the
+    single chokepoint every connector + core ffmpeg provider now uses."""
+
+    def test_posix_path_yields_empty_netloc(self, tmp_path):
+        """On POSIX, as_uri() already produces the empty-netloc form the
+        sink/validator expect — behavior-preserving for mac/Linux."""
+        asset = tmp_path / "out.mp4"
+        url = local_file_url(asset)
+        assert url == asset.as_uri()
+        parsed = urlparse(url)
+        assert parsed.netloc == ""
+        assert parsed.path == str(asset)
+
+    def test_posix_path_with_special_chars_round_trips(self, tmp_path):
+        """Spaces and other reserved chars are percent-encoded the same way
+        quote() encoded them, so existing POSIX behavior is unaffected."""
+        asset = tmp_path / "my clip (final).mp4"
+        url = local_file_url(asset)
+        assert url == asset.as_uri()
+        assert urlparse(url).netloc == ""
+
+    def test_windows_drive_letter_yields_empty_netloc_not_authority(self):
+        """The core bug: on Windows, f"file://{quote(str(path))}" percent-
+        encodes 'C:\\...' into 'C%3A%5C...', which urlparse reads entirely as
+        netloc with an empty path. as_uri() instead puts the drive letter in
+        the path with an empty netloc — the form url2pathname expects.
+
+        PureWindowsPath is used (not local_file_url directly) since as_uri()
+        is defined on PurePath and this must be exercised cross-platform —
+        a real Path on this host can never produce backslash/drive-letter
+        semantics.
+        """
+        win_path = PureWindowsPath(r"C:\Users\alice\out.mp4")
+        url = win_path.as_uri()
+        assert url == "file:///C:/Users/alice/out.mp4"
+        parsed = urlparse(url)
+        assert parsed.netloc == ""  # not "C%3A%5CUsers..." as the old quote() form produced
+        assert parsed.path == "/C:/Users/alice/out.mp4"
+
+    def test_windows_uri_round_trips_via_nturl2path(self):
+        """Exercises the real Windows path parser (nturl2path — the module
+        urllib.request.url2pathname dispatches to on Windows), not a mock
+        standing in for it, against the exact URL shape local_file_url
+        produces for a Windows path. Proves the connector -> sink contract
+        holds end-to-end without needing to run on Windows.
+
+        nturl2path is pure Python with no OS-specific syscalls, so it is
+        importable and gives Windows-accurate answers on any platform.
+        """
+        import nturl2path
+
+        win_path = PureWindowsPath(r"C:\Users\alice\out.mp4")
+        url = win_path.as_uri()
+        parsed = urlparse(url)
+        assert nturl2path.url2pathname(parsed.path) == r"C:\Users\alice\out.mp4"
 
 
 class TestRunAsync:

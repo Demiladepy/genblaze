@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-06-20 -->
+<!-- last_verified: 2026-09-21 -->
 # Feature: Media Embedding
 
 ## Purpose
@@ -34,7 +34,11 @@ Embed provenance manifests directly into media files (PNG, JPEG, WebP, MP4, MP3,
 
 ## Outputs
 - Modified media file with embedded manifest (inline) or `.json` sidecar
-- `EmbedResult` with `method` ("inline" or "sidecar"), `path`, `sidecar_path`
+- `EmbedResult` with `method` ("inline", "sidecar", "pointer", or "none"), `path`, `sidecar_path`
+- In sidecar/pointer modes, `path` always points at an existing media file: if
+  `output=` names a location distinct from the source, the source bytes are
+  copied there (same atomic-write contract as the inline handlers) before the
+  sidecar is written alongside it (#238)
 
 ## Flow
 - `SmartEmbedder` checks MIME type → selects handler via `get_handler()`
@@ -45,6 +49,7 @@ Embed provenance manifests directly into media files (PNG, JPEG, WebP, MP4, MP3,
 ## Edge Cases
 - Unsupported format → sidecar fallback
 - JPEG/WebP manifest > 60KB → sidecar fallback
+- PNG/JPEG/WebP/WAV container > 500 MB → `EmbeddingError` on `extract()` (bounded in-memory read; applies uniformly since content-sniffed handlers can't rely on file extension)
 - MP4 files 500 MB–2 GB → seek-based streaming embed (avoids loading full file into RAM)
 - MP4 files > 2 GB → `EmbeddingError` (use sidecar fallback)
 - MP3/WAV/AAC/M4A/FLAC without mutagen installed → `EmbeddingError` with install instructions
@@ -66,7 +71,12 @@ Manifest verification checks the canonical manifest payload and output asset
 sha256 coverage. `manifest.verify()` and `genblaze verify <file>` reject
 URL-only output assets and malformed sha256 declarations regardless of schema
 version; hash-only callers can use `manifest.verify_hash()`. None of these
-paths fetch asset URLs or hash the post-embed container file. See
+default paths fetch asset URLs or hash the post-embed container file.
+The opt-in `genblaze verify --fetch` fetches each `asset.url` and re-hashes
+those bytes against `asset.sha256`. One caveat: on a locally embedded file
+whose `asset.url` still points at that same file, `--fetch` compares post-embed
+bytes against a pre-embed hash and fails by design. Verify against the upstream
+artifact instead (option 1 above). See
 [trust-modes.md](trust-modes.md#asset-binding-caveat).
 
 ## WebP lossless preservation
@@ -79,7 +89,13 @@ if a lossy re-encode is acceptable.
 
 All inline embed paths (PNG, JPEG, WebP, MP4, MP3, WAV) and the sidecar handler use
 atomic temp-file + `os.replace` writes. A crash mid-embed leaves the source file
-intact; partial writes never overwrite the original.
+intact; partial writes never overwrite the original. This includes the sidecar
+handler's source-to-`output` copy when `output=` names a distinct path — copied
+via streaming I/O (not `read_media_bytes()`) so it shares MP4's 2 GB ceiling
+rather than the smaller 500 MB in-memory cap. The copy and the sidecar JSON
+write are each atomic individually but not as one transaction: if the sidecar
+write fails after the copy succeeds, the copied media is left without a
+sidecar. Callers always get an exception in that case, never a false success.
 
 ## Verification
 - Test files: `libs/core/tests/unit/test_png.py`, `test_jpeg.py`, `test_webp.py`, `test_mp4.py`, `test_mp3.py`, `test_wav.py`, `test_aac_handler.py`, `test_flac_handler.py`, `test_sidecar.py`, `test_embedder.py`, `libs/core/tests/golden/test_png_roundtrip.py`

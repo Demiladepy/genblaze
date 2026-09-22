@@ -1,12 +1,30 @@
 """genblaze-core — orchestration framework for media generation."""
 
+import logging
+
 from genblaze_core._version import __version__
+
+# Library convention: attach a no-op handler to the root of our logger
+# namespace so records don't fall through to logging.lastResort, which
+# writes WARNING+ to stderr for any application that hasn't configured
+# logging itself. Applications opt in via their own handlers (#46).
+#
+# Named "genblaze" (not "genblaze_core") because that is the namespace
+# every module in this package and its connectors logs under. Attached
+# here — not in the "genblaze" umbrella package at libs/meta — because
+# that umbrella is not always installed (pip install genblaze-core alone
+# is a supported path); attaching in genblaze_core covers both cases,
+# since the umbrella re-exports from genblaze_core and would otherwise
+# leave core-only installs unprotected.
+logging.getLogger("genblaze").addHandler(logging.NullHandler())
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # pipeline (primary entry point)
     "Pipeline": ("genblaze_core.pipeline.pipeline", "Pipeline"),
     "PipelineResult": ("genblaze_core.pipeline.result", "PipelineResult"),
     "StepCompleteEvent": ("genblaze_core.pipeline.result", "StepCompleteEvent"),
+    # runnable configuration
+    "RunnableConfig": ("genblaze_core.runnable.config", "RunnableConfig"),
     # pipeline cache
     "StepCache": ("genblaze_core.pipeline.cache", "StepCache"),
     # pipeline templates
@@ -106,10 +124,11 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "DeleteError": ("genblaze_core.storage.types", "DeleteError"),
     "DeleteResult": ("genblaze_core.storage.types", "DeleteResult"),
     "TransferProgress": ("genblaze_core.storage.types", "TransferProgress"),
-    # testing
-    "MockProvider": ("genblaze_core.testing", "MockProvider"),
-    "MockVideoProvider": ("genblaze_core.testing", "MockVideoProvider"),
-    "MockAudioProvider": ("genblaze_core.testing", "MockAudioProvider"),
+    # testing — mocks are pytest-free (genblaze_core.mocks);
+    # ProviderComplianceTests requires pytest (genblaze_core.testing).
+    "MockProvider": ("genblaze_core.mocks", "MockProvider"),
+    "MockVideoProvider": ("genblaze_core.mocks", "MockVideoProvider"),
+    "MockAudioProvider": ("genblaze_core.mocks", "MockAudioProvider"),
     "ProviderComplianceTests": ("genblaze_core.testing", "ProviderComplianceTests"),
     # exceptions
     "GenblazeError": ("genblaze_core.exceptions", "GenblazeError"),
@@ -139,12 +158,30 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
 __all__ = [*_LAZY_IMPORTS.keys(), "__version__"]
 
 
+def __dir__() -> list[str]:
+    return sorted(set(__all__) | set(globals().keys()))
+
+
 def __getattr__(name: str):
     if name in _LAZY_IMPORTS:
         module_path, attr = _LAZY_IMPORTS[name]
         import importlib
 
-        mod = importlib.import_module(module_path)
+        from genblaze_core._optional import OptionalDependencyError
+
+        try:
+            mod = importlib.import_module(module_path)
+        except OptionalDependencyError as exc:
+            # Issue #165: OptionalDependencyError is an ImportError, not an
+            # AttributeError, so hasattr()/getattr(obj, name, default) and
+            # introspection tooling (which only swallow AttributeError) would
+            # otherwise crash instead of treating the symbol as absent. Since
+            # this exact except clause *is* the __getattr__ path a consumer
+            # also hits on real usage (e.g. genblaze_core.ParquetSink(...)),
+            # re-raise as AttributeError with the original install-hint
+            # message preserved (chained via `from` so the typed error is
+            # still reachable through __cause__).
+            raise AttributeError(str(exc)) from exc
         val = getattr(mod, attr)
         globals()[name] = val
         return val

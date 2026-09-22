@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "genblaze-decart"
-version = "0.3.1"
+version = "0.3.3"
 description = "Decart Lucy video/image provider adapter for genblaze"
 authors = [{name = "Jeronimo De Leon", email = "jdeleon@backblaze.com"}]
 readme = "README.md"
@@ -12,7 +12,6 @@ requires-python = ">=3.11"
 license = "MIT"
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
     "Typing :: Typed",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -23,8 +22,12 @@ classifiers = [
 keywords = ["genblaze", "ai", "media", "manifest", "provenance", "c2pa-ready", "genai", "pipeline", "decart", "video", "image"]
 
 dependencies = [
-    "genblaze-core>=0.3.4,<0.4",
-    "decart>=0.0.28",
+    "genblaze-core>=0.3.7,<0.4",
+    # <1: bounded-major convention (#61) — decart is pre-1.0, so this caps at
+    # its next major (matches the assemblyai/hume precedent for other
+    # pre-1.0 SDKs elsewhere in this repo) rather than inventing a
+    # next-minor rule for this one package.
+    "decart>=0.0.28,<1",
 ]
 
 [project.urls]

@@ -17,6 +17,7 @@ import asyncio
 import copy
 import logging
 import pickle
+import queue
 import re
 import threading
 import time
@@ -30,7 +31,7 @@ from genblaze_core.providers.discovery import (
     DiscoveryResult,
     _DiscoveryCache,
 )
-from genblaze_core.providers.family import DiscoverySupport, ModelFamily
+from genblaze_core.providers.family import DiscoverySupport, LiveProbeResult, ModelFamily
 from genblaze_core.providers.model_registry import ModelRegistry
 from genblaze_core.providers.spec import ModelSpec
 
@@ -100,6 +101,37 @@ def _make_family_provider(family: ModelFamily) -> BaseProvider:
     return _FamilyProvider()
 
 
+def _make_fallback_probe_provider(result: LiveProbeResult) -> BaseProvider:
+    """A PARTIAL provider with no families at all — everything hits the
+    fallback path — and a ``fallback_probe`` that always returns ``result``
+    (#248)."""
+
+    class _FallbackProbeProvider(BaseProvider):
+        name = "fallback-probe-test"
+        discovery_support = DiscoverySupport.PARTIAL
+
+        @classmethod
+        def create_registry(cls) -> ModelRegistry:
+            return ModelRegistry(fallback_probe=lambda slug, **kw: result)
+
+        def _invoke_family_probe(self, probe, model_id):  # type: ignore[override]
+            return probe(model_id)
+
+        def get_capabilities(self) -> ProviderCapabilities:
+            return ProviderCapabilities(supported_modalities=[Modality.IMAGE], models=[])
+
+        def submit(self, step, config=None):  # type: ignore[no-untyped-def]
+            return "pid"
+
+        def poll(self, prediction_id, config=None):  # type: ignore[no-untyped-def]
+            return True
+
+        def fetch_output(self, prediction_id, step):  # type: ignore[no-untyped-def]
+            return step
+
+    return _FallbackProbeProvider()
+
+
 class TestNotFoundRaises:
     def test_native_missing_slug_raises(self) -> None:
         p = _make_native_provider({"live-slug-1", "live-slug-2"})
@@ -127,6 +159,18 @@ class TestNotFoundRaises:
             pipe._validate_steps()
         msg = str(exc.value)
         assert "refresh=True" in msg, f"NOT_FOUND error must mention the refresh recovery: {msg}"
+
+    def test_fallback_probe_dead_raises(self) -> None:
+        """#248: a slug matching no family, on a registry with a
+        ``fallback_probe`` configured, now raises at preflight when the
+        probe returns DEAD — instead of silently passing through as
+        UNKNOWN_PERMISSIVE with no signal either way."""
+        p = _make_fallback_probe_provider(LiveProbeResult.DEAD)
+        pipe = Pipeline("t").step(p, model="fabricated-slug", modality=Modality.IMAGE, prompt="hi")
+        with pytest.raises(ProviderError) as exc:
+            pipe._validate_steps()
+        assert "not found" in str(exc.value).lower()
+        assert "fabricated-slug" in str(exc.value)
 
     def test_error_message_propagates_validation_detail(self) -> None:
         """When validate_model returns a NOT_FOUND with a ``detail``
@@ -163,6 +207,18 @@ class TestOkAuthoritativeSilent:
         with caplog.at_level(logging.WARNING, logger="genblaze.pipeline"):
             pipe._validate_steps()
         # No preflight WARNs emitted for OK_AUTHORITATIVE.
+        preflight_warns = [r for r in caplog.records if "preflight." in r.getMessage()]
+        assert preflight_warns == []
+
+    def test_fallback_probe_live_silent(self, caplog) -> None:
+        """#248: the flip side of ``test_fallback_probe_dead_raises`` — a
+        slug matching no family but confirmed LIVE by the fallback_probe
+        grades OK_AUTHORITATIVE and preflight stays silent, same as any
+        other authoritative confirmation."""
+        p = _make_fallback_probe_provider(LiveProbeResult.LIVE)
+        pipe = Pipeline("t").step(p, model="real-slug", modality=Modality.IMAGE, prompt="hi")
+        with caplog.at_level(logging.WARNING, logger="genblaze.pipeline"):
+            pipe._validate_steps()
         preflight_warns = [r for r in caplog.records if "preflight." in r.getMessage()]
         assert preflight_warns == []
 
@@ -215,6 +271,20 @@ class TestUnknownPermissiveWarns:
         with caplog.at_level(logging.WARNING, logger="genblaze.pipeline"):
             pipe._validate_steps()
 
+        unknown_warns = [r for r in caplog.records if "preflight.unknown" in r.getMessage()]
+        assert len(unknown_warns) == 1
+
+    def test_fallback_probe_unknown_still_warns(self, caplog) -> None:
+        """#248: when the fallback_probe itself can't tell (auth/rate-limit/
+        5xx → UNKNOWN), preflight still falls through to the same
+        UNKNOWN_PERMISSIVE WARN as a registry with no fallback_probe at
+        all — the probe only sharpens the LIVE/DEAD cases."""
+        p = _make_fallback_probe_provider(LiveProbeResult.UNKNOWN)
+        pipe = Pipeline("t").step(
+            p, model="inconclusive-slug", modality=Modality.IMAGE, prompt="hi"
+        )
+        with caplog.at_level(logging.WARNING, logger="genblaze.pipeline"):
+            pipe._validate_steps()
         unknown_warns = [r for r in caplog.records if "preflight.unknown" in r.getMessage()]
         assert len(unknown_warns) == 1
 
@@ -447,3 +517,50 @@ class TestPipelineCopySemantics:
         # across the whole batch — this must NOT change.
         assert clone._warned_preflight_lock is p._warned_preflight_lock
         assert clone._warned_preflight is p._warned_preflight
+
+
+class TestPipelineEmitterSlotCopySemantics:
+    """Issue #151: the per-instance stream emitter slot must never be shared.
+
+    Unlike the WARN-dedup lock/set, ALL THREE copy protocols give the clone a
+    brand-new ``EmitterSlot`` — including shallow ``copy.copy`` (used by
+    batch_run/abatch_run). A shallow-shared emitter slot would let a
+    batch_run() clone read the spawning pipeline's active stream emitter when
+    both run in the same thread/task Context, reintroducing #151's leak in a
+    narrower shape. See ``test_batch_run_clone_inside_outer_stream_does_not_leak``
+    in test_streaming.py for the corresponding behavioral regression test.
+    """
+
+    def test_deepcopy_isolates_emitter_slot(self) -> None:
+        p = Pipeline("orig")
+        clone = copy.deepcopy(p)
+        assert clone._emitter_slot is not p._emitter_slot
+
+    def test_pickle_roundtrip_rebuilds_emitter_slot(self) -> None:
+        p = Pipeline("orig")
+        clone = pickle.loads(pickle.dumps(p))  # noqa: S301 — round-tripping our own pipeline in a test
+        assert isinstance(clone, Pipeline)
+        assert clone._emitter_slot is not p._emitter_slot
+        # The rebuilt slot must be a real, usable EmitterSlot (get() works).
+        assert clone._emitter_slot.get() is None
+
+    def test_shallow_copy_does_not_share_emitter_slot(self) -> None:
+        """Unlike the WARN-dedup lock, batch clones must NOT share the emitter slot."""
+        p = Pipeline("orig")
+        clone = copy.copy(p)
+        assert clone._emitter_slot is not p._emitter_slot
+
+    def test_shallow_copy_clone_does_not_observe_original_emitter(self) -> None:
+        """A clone's ``_event_emitter`` must stay None even when the original
+        has an emitter installed in the SAME thread/task Context — the exact
+        scenario a nested batch_run() invoked from inside stream() hits.
+        """
+        from genblaze_core.pipeline.streaming import QueueEmitter
+
+        p = Pipeline("orig")
+        p.attach_emitter(QueueEmitter(q=queue.Queue()))
+        try:
+            clone = copy.copy(p)
+            assert clone._event_emitter is None
+        finally:
+            p.attach_emitter(None)

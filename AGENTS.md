@@ -3,7 +3,7 @@
 
 ## Repo Purpose
 
-Orchestration framework for generative media pipelines with manifest-based provenance tracking. Produces 16 pip-installable packages: `genblaze-core`, 13 provider adapter packages (`genblaze-openai`, `genblaze-google`, `genblaze-runway`, `genblaze-luma`, `genblaze-decart`, `genblaze-replicate`, `genblaze-elevenlabs`, `genblaze-stability-audio`, `genblaze-lmnt`, `genblaze-hume`, `genblaze-gmicloud`, `genblaze-nvidia`, `genblaze-assemblyai`), `genblaze-s3`, and `genblaze-cli`.
+Orchestration framework for generative media pipelines with manifest-based provenance tracking. Produces 17 pip-installable packages: `genblaze-core`, 14 provider adapter packages (`genblaze-openai`, `genblaze-google`, `genblaze-runway`, `genblaze-luma`, `genblaze-decart`, `genblaze-replicate`, `genblaze-elevenlabs`, `genblaze-stability-audio`, `genblaze-lmnt`, `genblaze-hume`, `genblaze-gmicloud`, `genblaze-nvidia`, `genblaze-assemblyai`, `genblaze-atlascloud`), `genblaze-s3`, and `genblaze-cli`.
 
 ## Architecture Boundaries
 
@@ -34,6 +34,7 @@ Orchestration framework for generative media pipelines with manifest-based prove
 - [RELEASING.md](RELEASING.md) — Release wave naming, publish pipeline, dry-run path
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Dev setup, PR process, release notes via CHANGELOG
 - [docs/features/](docs/features/) — Feature docs (one per core feature)
+- [docs/features/maintainer-agent.md](docs/features/maintainer-agent.md) — Maintainer agent flow, modes, and invariants (human reference)
 - [docs/app-workflows.md](docs/app-workflows.md) — User journeys
 - [docs/dev-workflows.md](docs/dev-workflows.md) — Engineering workflows
 - [docs/exec-plans/active/](docs/exec-plans/active/) — Active execution plans

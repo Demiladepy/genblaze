@@ -54,7 +54,12 @@ ehthumbs.db
 !.env.example
 *.pem
 *.key
-credentials.json
+credentials*
+*.credentials
+*_rsa
+*.p12
+*.pfx
+*.keystore
 
 # Jupyter
 .ipynb_checkpoints/
@@ -74,3 +79,7 @@ CLAUDE.local.md
 *.tmp
 *.bak
 *.log
+.pre-pr-check/
+pre-pr-check-findings-batch-*.md
+# Node (libs/spec type-generation toolchain)
+node_modules/

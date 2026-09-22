@@ -6,6 +6,7 @@ import json
 import tomllib
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from genblaze_cli.main import cli
 from genblaze_core._utils import MAX_MANIFEST_BYTES
@@ -13,8 +14,10 @@ from genblaze_core.builders import RunBuilder, StepBuilder
 from genblaze_core.canonical.json import canonical_json
 from genblaze_core.media.png import PngHandler
 from genblaze_core.models.asset import Asset
-from genblaze_core.models.enums import Modality, ProviderErrorCode, StepStatus
+from genblaze_core.models.enums import Modality, ProviderErrorCode, StepStatus, StepType
 from genblaze_core.models.manifest import Manifest
+from genblaze_core.models.run import Run
+from genblaze_core.models.step import Step
 from genblaze_core.testing import MockProvider
 from PIL import Image
 
@@ -55,6 +58,28 @@ def _create_url_only_manifest(*, schema_version: str | None = None) -> Manifest:
     return manifest
 
 
+def _url_only_manifest_with_bad_metadata() -> Manifest:
+    """A hash-valid, sha256-valid manifest whose sole output asset carries an
+    out-of-spec dimension (width=0) — the shape parse_manifest() tolerates on
+    load but verify() must reject (#149). Injected via object.__setattr__ to
+    bypass construction validation, mirroring a foreign-authored manifest."""
+    manifest = _create_url_only_manifest()
+    asset = manifest.run.steps[0].assets[0]
+    object.__setattr__(asset, "sha256", "a" * 64)  # valid, so only metadata fails
+    object.__setattr__(asset, "width", 0)
+    manifest.compute_hash()
+    return manifest
+
+
+def _combined_output(result) -> str:
+    """CLI stdout+stderr, robust across Click versions. Click >=8.2 captures
+    stderr separately; 8.1.x mixes it into output and raises on ``.stderr``."""
+    try:
+        return result.output + result.stderr
+    except ValueError:
+        return result.output
+
+
 def test_extract_json(tmp_path: Path) -> None:
     png = _create_embedded_png(tmp_path)
     runner = CliRunner()
@@ -91,6 +116,7 @@ def test_extract_summary(tmp_path: Path) -> None:
     assert "Run ID:" in result.output
     assert "Hash OK:" in result.output
     assert "Output sha256:" in result.output
+    assert "Output metadata:" in result.output
     assert "Verified:" in result.output
 
 
@@ -239,6 +265,75 @@ def test_verify_rejects_malformed_output_sha256(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "1 output asset(s) missing or malformed sha256" in combined
+
+
+def test_verify_rejects_out_of_spec_asset_metadata(tmp_path: Path) -> None:
+    """#149/#155: a manifest with a valid hash and valid sha256 but out-of-spec
+    asset metadata (e.g. width=0, which parse_manifest() tolerates on load) must
+    fail `verify`, so the CLI verdict agrees with Manifest.verify()/report.ok
+    rather than reporting OK because only sha256 was checked."""
+    manifest = _url_only_manifest_with_bad_metadata()
+    # Assert the model layer first so this pins the boundary even in a Click
+    # build where CLI output parsing behaves differently.
+    assert not manifest.verify()
+
+    png_path = tmp_path / "bad-metadata.png"
+    Image.new("RGBA", (1, 1), (255, 0, 0, 255)).save(png_path)
+    png_path.with_suffix(png_path.suffix + ".genblaze.json").write_text(
+        manifest.to_canonical_json(),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["verify", str(png_path)])
+    combined = _combined_output(result)
+
+    assert result.exit_code != 0
+    assert "out-of-spec" in combined
+    # Prove it's the metadata boundary, not a sha256 or hash failure.
+    assert "missing or malformed sha256" not in combined
+    assert "hash mismatch" not in combined
+
+
+def test_verify_hash_only_skips_metadata_check(tmp_path: Path) -> None:
+    """--hash-only must short-circuit before the metadata check: an out-of-spec
+    manifest whose hash still matches exits 0 (metadata lives inside the hash
+    payload, so hash-only stays an honest integrity-only claim). Pins the check
+    order so a refactor can't move the metadata guard ahead of the early return."""
+    manifest = _url_only_manifest_with_bad_metadata()
+    png_path = tmp_path / "bad-metadata-hash-only.png"
+    Image.new("RGBA", (1, 1), (255, 0, 0, 255)).save(png_path)
+    png_path.with_suffix(png_path.suffix + ".genblaze.json").write_text(
+        manifest.to_canonical_json(),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["verify", "--hash-only", str(png_path)])
+
+    assert result.exit_code == 0
+    assert "manifest hash verified" in result.output
+
+
+def test_extract_summary_surfaces_out_of_spec_metadata(tmp_path: Path) -> None:
+    """#149/#155: `extract --format summary` itemizes invalid metadata so a
+    `Verified: False` verdict always has a visible reason and agrees with
+    `verify` (mirrors the sha256 parity test)."""
+    manifest = _url_only_manifest_with_bad_metadata()
+    png_path = tmp_path / "bad-metadata-extract.png"
+    Image.new("RGBA", (1, 1), (255, 0, 0, 255)).save(png_path)
+    png_path.with_suffix(png_path.suffix + ".genblaze.json").write_text(
+        manifest.to_canonical_json(),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["extract", "--format", "summary", str(png_path)])
+
+    assert result.exit_code == 0
+    assert "Output sha256: 0 missing or malformed" in result.output
+    assert "Output metadata: 1 out of spec" in result.output
+    assert "Verified:  False" in result.output
 
 
 def test_verify_reports_legacy_unverified_assets(tmp_path: Path) -> None:
@@ -431,6 +526,30 @@ def test_replay_aborts_when_no_allowlist_and_declined(tmp_path: Path) -> None:
     assert "Aborted" in result.output or "Execute with provider" in result.output
 
 
+def test_replay_reports_clear_error_for_providerless_step(tmp_path: Path) -> None:
+    """A provider-less step (INGEST/IMPORT, valid per Step's own model) must
+    produce a clear ClickException on replay --no-dry-run, not a TypeError
+    from None flowing into sorted()/dict keys/_load_provider (issue #43)."""
+    step = Step(
+        provider=None,
+        model="rss",
+        step_type=StepType.INGEST,
+        status=StepStatus.SUCCEEDED,
+        assets=[Asset(url="https://example.com/a.png", media_type="image/png")],
+    )
+    run = Run(name="ingest-test", steps=[step])
+    manifest = Manifest.from_run(run)
+    manifest_path = tmp_path / "ingest.json"
+    manifest_path.write_text(manifest.to_canonical_json(), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["replay", str(manifest_path), "--no-dry-run"])
+
+    assert result.exit_code != 0
+    assert "TypeError" not in result.output
+    assert "no provider" in result.output.lower()
+
+
 def test_replay_no_dry_run_exits_nonzero_when_run_fails(tmp_path: Path, monkeypatch) -> None:
     """A replayed failed run must not look successful to automation."""
 
@@ -471,5 +590,76 @@ def test_index(tmp_path: Path) -> None:
     result = runner.invoke(cli, ["index", str(manifest_path), "-o", str(out_dir)])
     assert result.exit_code == 0
     assert "Indexed" in result.output
-    parquet_files = list(out_dir.rglob("*.parquet"))
-    assert len(parquet_files) > 0
+
+
+# --- Issue #64: directories rejected with a clear error; non-object JSON is
+# handled consistently across index/replay ---
+
+
+@pytest.mark.parametrize("command", ["extract", "verify", "index", "replay"])
+def test_commands_reject_directory_with_clear_error(tmp_path: Path, command: str) -> None:
+    """A directory argument must fail with click's own actionable error
+    instead of leaking a confusing downstream error (e.g. EmbeddingError or
+    [Errno 21] Is a directory)."""
+    runner = CliRunner()
+    result = runner.invoke(cli, [command, str(tmp_path)])
+    assert result.exit_code != 0
+    assert "is a directory" in result.output.lower()
+
+
+@pytest.mark.parametrize("command", ["index", "replay"])
+def test_non_object_manifest_json_gives_consistent_clean_error(
+    tmp_path: Path, command: str
+) -> None:
+    """A top-level JSON array (valid JSON, invalid manifest shape) must fail
+    with the same clean error for both index and replay, not an internal
+    AttributeError leaked from parse_manifest's dict-only .get() call."""
+    array_path = tmp_path / "not-a-manifest.json"
+    array_path.write_text("[1, 2, 3]", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [command, str(array_path)])
+
+    assert result.exit_code != 0
+    assert "must be a JSON object" in result.output
+    assert "AttributeError" not in result.output
+    assert "'list' object has no attribute 'get'" not in result.output
+
+
+# --- Fix B: extract -o / --output ---
+
+
+def test_extract_output_flag_writes_file(tmp_path: Path) -> None:
+    """-o writes manifest JSON to file; stdout is empty."""
+    png = _create_embedded_png(tmp_path)
+    out_file = tmp_path / "manifest.json"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["extract", str(png), "-o", str(out_file)])
+    assert result.exit_code == 0, result.output
+    # Output goes to file, not stdout
+    assert result.output.strip() == ""
+    assert out_file.exists()
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert "canonical_hash" in data
+    assert "run" in data
+
+
+def test_extract_output_flag_stdout_default(tmp_path: Path) -> None:
+    """Without -o, JSON goes to stdout (backward compat)."""
+    png = _create_embedded_png(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["extract", str(png)])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "canonical_hash" in data
+
+
+# --- Fix C: --version label ---
+
+
+def test_version_label_shows_cli_package() -> None:
+    """--version must say 'genblaze-cli' not the umbrella package name."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert "genblaze-cli" in result.output

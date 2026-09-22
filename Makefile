@@ -17,6 +17,7 @@ install:
 	pip install -e libs/connectors/langsmith
 	pip install -e libs/connectors/nvidia
 	pip install -e libs/connectors/assemblyai
+	pip install -e libs/connectors/atlascloud
 	pip install -e cli
 	pip install -e libs/meta
 
@@ -37,6 +38,7 @@ install-dev:
 	pip install -e "libs/connectors/langsmith[dev]"
 	pip install -e "libs/connectors/nvidia[dev]"
 	pip install -e "libs/connectors/assemblyai[dev]"
+	pip install -e "libs/connectors/atlascloud[dev]"
 	pip install -e "cli[dev]"
 	pip install -e "libs/meta[dev]"
 
@@ -57,6 +59,7 @@ test:
 	cd libs/connectors/langsmith && pytest -v
 	cd libs/connectors/nvidia && pytest -v
 	cd libs/connectors/assemblyai && pytest -v
+	cd libs/connectors/atlascloud && pytest -v
 	cd cli && pytest tests/ -v
 	cd libs/meta && pytest tests/ -v
 	pytest tools/tests/ -v
@@ -127,10 +130,10 @@ pypi-pin-parity:
 	@python tools/check_pin_parity.py
 
 # Pre-release wheel install smoke test. Builds every package to a
-# local wheelhouse, then installs ``genblaze[all]`` into a fresh
-# venv from that wheelhouse only (``--no-index``). Catches version-
-# constraint breakage that the editable installs in ``install-dev``
-# bypass. Run this before tagging a release.
+# local wheelhouse, then installs the local genblaze wheels into a
+# fresh venv while PyPI remains enabled for transitive dependencies.
+# Catches version-constraint breakage that the editable installs in
+# ``install-dev`` bypass. Run this before tagging a release.
 release-smoke:
 	@tools/release_smoke.sh
 
@@ -147,10 +150,10 @@ pre-release: lint typecheck ts-types-check pypi-metadata-check pypi-pin-parity t
 	@echo "See RELEASING.md for the full flow."
 
 # Post-publish verification. Installs the umbrella from public PyPI
-# into a throwaway venv and imports the core surface, mirroring what
-# real users see — this is what catches the same-version-different-
-# content trap that bit the 0.3.0 wave. Pass the umbrella version via
-# VERSION=<X.Y.Z>:
+# into a throwaway venv and imports the umbrella, core, s3, and every
+# genblaze[all] connector, mirroring what real users see — this is what
+# catches the same-version-different-content trap that bit the 0.3.0
+# wave. Pass the umbrella version via VERSION=<X.Y.Z>:
 #
 #   make post-release VERSION=0.4.0
 #
@@ -170,8 +173,8 @@ post-release:
 		echo "Installing genblaze[all]==$(VERSION) from public PyPI..."; \
 		$$VENV/bin/pip install "genblaze[all]==$(VERSION)"; \
 		echo ""; \
-		echo "Smoke-importing core surface..."; \
-		$$VENV/bin/python -c "import genblaze_core, genblaze_s3; print('import ok')"; \
+		echo "Smoke-importing genblaze[all] modules..."; \
+		$$VENV/bin/python tools/release_import_smoke.py; \
 		echo ""; \
 		echo "Installed versions:"; \
 		$$VENV/bin/pip show genblaze genblaze-core genblaze-s3 | grep -E '^(Name|Version)'; \

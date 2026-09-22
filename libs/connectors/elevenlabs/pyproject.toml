@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "genblaze-elevenlabs"
-version = "0.3.1"
+version = "0.3.3"
 description = "ElevenLabs TTS and sound effects provider adapter for genblaze"
 authors = [{name = "Jeronimo De Leon", email = "jdeleon@backblaze.com"}]
 readme = "README.md"
@@ -12,7 +12,6 @@ requires-python = ">=3.11"
 license = "MIT"
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
     "Typing :: Typed",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -23,8 +22,8 @@ classifiers = [
 keywords = ["genblaze", "ai", "media", "manifest", "provenance", "c2pa-ready", "genai", "pipeline", "elevenlabs", "tts", "audio"]
 
 dependencies = [
-    "genblaze-core>=0.3.4,<0.4",
-    "elevenlabs>=2.0",
+    "genblaze-core>=0.3.7,<0.4",
+    "elevenlabs>=2.0,<3",
 ]
 
 [project.urls]

@@ -8,7 +8,12 @@ import pytest
 from genblaze_core._utils import MAX_ERROR_LENGTH, TRUNCATION_MARKER
 from genblaze_core.exceptions import GenblazeError
 from genblaze_core.models.asset import Asset
-from genblaze_core.models.enums import ProviderErrorCode, RunStatus, StepStatus
+from genblaze_core.models.enums import (
+    PromptVisibility,
+    ProviderErrorCode,
+    RunStatus,
+    StepStatus,
+)
 from genblaze_core.models.step import Step
 from genblaze_core.pipeline import Pipeline, StepCache
 from genblaze_core.pipeline.result import PipelineResult
@@ -202,6 +207,63 @@ def test_step_cache_key_tenant_isolation() -> None:
     # (normalize_tenant_id strips whitespace, so both "" and "   " collapse to None).
     assert step_cache_key(s, tenant_id="") == step_cache_key(s)
     assert step_cache_key(s, tenant_id="   ") == step_cache_key(s)
+
+
+def test_step_cache_key_input_order_sensitive() -> None:
+    """Issue #71: reversing step.inputs must change the cache key.
+
+    Providers that consume step.inputs positionally (multi-image edit/compose,
+    multimodal chat) produce different output when input order changes.
+    step_cache_key must preserve that order instead of sorting inputs, so a
+    reordered request can't wrongly hit an earlier run's cached asset — this
+    also keeps the cache key consistent with the order-preserving manifest
+    canonical hash.
+    """
+    from genblaze_core.pipeline.cache import step_cache_key
+
+    a1 = Asset(url="https://upload.test/first.png", media_type="image/png", sha256="1" * 64)
+    a2 = Asset(url="https://upload.test/second.png", media_type="image/png", sha256="2" * 64)
+
+    forward = Step(provider="p", model="m", prompt="same", inputs=[a1, a2])
+    backward = Step(provider="p", model="m", prompt="same", inputs=[a2, a1])
+    same_order = Step(provider="p", model="m", prompt="same", inputs=[a1, a2])
+
+    assert step_cache_key(forward) != step_cache_key(backward)
+    assert step_cache_key(forward) == step_cache_key(same_order)
+
+    # URL-fallback branch (sha256=None): #71 explicitly calls out URL-only
+    # inputs, and the `sha256 or url` fallback must stay order-sensitive too.
+    u1 = Asset(url="https://upload.test/first.png", media_type="image/png", sha256=None)
+    u2 = Asset(url="https://upload.test/second.png", media_type="image/png", sha256=None)
+    assert step_cache_key(
+        Step(provider="p", model="m", prompt="same", inputs=[u1, u2])
+    ) != step_cache_key(Step(provider="p", model="m", prompt="same", inputs=[u2, u1]))
+
+
+def test_pipeline_cache_input_order_sensitive(tmp_path: Path) -> None:
+    """Issue #71: a reordered-input request must MISS a shared cache, end to end.
+
+    Mirrors test_pipeline_cache_no_cross_tenant_hit (#68): drives the full
+    Pipeline().cache().run() path so the guarantee holds at the layer that
+    actually serves stale assets, not only at step_cache_key.
+    """
+    cache = StepCache(tmp_path / "cache")
+    a1 = Asset(url="https://upload.test/fg.png", media_type="image/png", sha256="1" * 64)
+    a2 = Asset(url="https://upload.test/bg.png", media_type="image/png", sha256="2" * 64)
+
+    p1 = CountingProvider()
+    Pipeline("c").cache(cache).step(p1, model="m", prompt="p", external_inputs=[a1, a2]).run()
+    assert p1.invoke_count == 1
+
+    # Same step, inputs reversed -> order-sensitive key -> MISS (no wrong-asset hit).
+    p2 = CountingProvider()
+    Pipeline("c").cache(cache).step(p2, model="m", prompt="p", external_inputs=[a2, a1]).run()
+    assert p2.invoke_count == 1
+
+    # Original order again -> cache HIT, provider not called.
+    p3 = CountingProvider()
+    Pipeline("c").cache(cache).step(p3, model="m", prompt="p", external_inputs=[a1, a2]).run()
+    assert p3.invoke_count == 0
 
 
 def test_pipeline_cache_no_cross_tenant_hit(tmp_path: Path) -> None:
@@ -988,6 +1050,81 @@ async def test_abatch_run_respects_concurrency() -> None:
         .abatch_run(["a", "b", "c", "d"], max_concurrency=2)
     )
     assert len(results) == 4
+
+
+# --- #83 — batch max_concurrency validation + honesty about concurrency ---
+
+
+def test_batch_run_rejects_zero_max_concurrency() -> None:
+    """max_concurrency=0 must fail fast, not silently no-op (issue #83)."""
+    provider = MockProvider()
+    with pytest.raises(GenblazeError, match="max_concurrency"):
+        Pipeline("batch-zero").step(provider, model="m").batch_run(
+            ["a"], max_concurrency=0, raise_on_failure=False
+        )
+
+
+def test_batch_run_rejects_negative_max_concurrency() -> None:
+    provider = MockProvider()
+    with pytest.raises(GenblazeError, match="max_concurrency"):
+        Pipeline("batch-neg").step(provider, model="m").batch_run(
+            ["a"], max_concurrency=-1, raise_on_failure=False
+        )
+
+
+def test_batch_run_implicit_default_does_not_warn(recwarn) -> None:
+    """Omitting max_concurrency (the common case) must stay silent — only an
+    EXPLICIT value should warn about the sequential-only contract (#83)."""
+    provider = MockProvider()
+    Pipeline("batch-implicit").step(provider, model="m").batch_run(["a"], raise_on_failure=False)
+    assert not any(w.category is UserWarning for w in recwarn.list)
+
+
+def test_batch_run_explicit_max_concurrency_warns(recwarn) -> None:
+    """An explicit max_concurrency (even the historical default value) warns
+    that sync batch_run() doesn't actually parallelize (#83)."""
+    provider = MockProvider()
+    Pipeline("batch-explicit").step(provider, model="m").batch_run(
+        ["a"], max_concurrency=5, raise_on_failure=False
+    )
+    assert any(w.category is UserWarning for w in recwarn.list)
+
+
+@pytest.mark.asyncio
+async def test_abatch_run_rejects_zero_max_concurrency() -> None:
+    """abatch_run(max_concurrency=0) must raise immediately instead of
+    building a Semaphore no task can ever acquire — a permanent hang (#83)."""
+    provider = MockProvider()
+    with pytest.raises(GenblazeError, match="max_concurrency"):
+        await (
+            Pipeline("abatch-zero")
+            .step(provider, model="m")
+            .abatch_run(["a"], max_concurrency=0, raise_on_failure=False)
+        )
+
+
+@pytest.mark.asyncio
+async def test_abatch_run_rejects_negative_max_concurrency() -> None:
+    provider = MockProvider()
+    with pytest.raises(GenblazeError, match="max_concurrency"):
+        await (
+            Pipeline("abatch-neg")
+            .step(provider, model="m")
+            .abatch_run(["a"], max_concurrency=-1, raise_on_failure=False)
+        )
+
+
+@pytest.mark.asyncio
+async def test_abatch_run_never_warns_about_concurrency(recwarn) -> None:
+    """abatch_run() genuinely honors max_concurrency — it must never emit the
+    sync-only sequential-contract warning, explicit value or not (#83)."""
+    provider = MockProvider()
+    await (
+        Pipeline("abatch-explicit")
+        .step(provider, model="m")
+        .abatch_run(["a"], max_concurrency=3, raise_on_failure=False)
+    )
+    assert not any(w.category is UserWarning for w in recwarn.list)
 
 
 # --- Fallback model tests ---
@@ -2001,6 +2138,293 @@ def test_pipeline_allows_normal_params() -> None:
         .run()
     )
     assert result.run.status == RunStatus.COMPLETED
+
+
+def test_step_params_dict_flattens_to_top_level() -> None:
+    """params={...} passed to .step() must land as top-level Step.params keys,
+    not nested under a literal 'params' key (issue #133).
+
+    Before the fix, ``**params`` was both the name of the catch-all kwargs
+    dict and the name a caller naturally reaches for (mirroring the
+    documented ``Step.params`` field), so ``step(..., params={"image": ...})``
+    silently nested the whole dict one level too deep: ``{"params": {"image":
+    ...}}`` instead of ``{"image": ...}``. Providers reading ``step.params["image"]``
+    directly (rather than reimplementing genblaze's own allowlist machinery)
+    never saw the key.
+    """
+    p = MockProvider()
+    result = (
+        Pipeline("params-dict-test")
+        .step(
+            p,
+            model="m",
+            prompt="p",
+            params={"image": "http://example.com/ref.png", "length": 20.0},
+        )
+        .run()
+    )
+    step = result.run.steps[0]
+    assert step.params == {"image": "http://example.com/ref.png", "length": 20.0}
+
+
+def test_step_params_kwargs_win_over_params_dict_on_collision() -> None:
+    """Top-level kwargs override a colliding key in params={} — the more
+    specific, call-site-local form wins."""
+    p = MockProvider()
+    result = (
+        Pipeline("params-collision-test")
+        .step(
+            p,
+            model="m",
+            prompt="p",
+            params={"quality": "sd", "size": "512x512"},
+            quality="hd",
+        )
+        .run()
+    )
+    step = result.run.steps[0]
+    assert step.params == {"quality": "hd", "size": "512x512"}
+
+
+# -----------------------------------------------------------------------------
+# #53 — Pipeline.step(metadata=, prompt_visibility=) land on Step fields, not params.
+# -----------------------------------------------------------------------------
+
+
+def test_step_prompt_visibility_lands_on_step_field() -> None:
+    """prompt_visibility=PRIVATE must produce a Step with that field set —
+    not silently default to PUBLIC while the value leaks into params (#53)."""
+    p = MockProvider()
+    result = (
+        Pipeline("visibility-test")
+        .step(
+            p,
+            model="m",
+            prompt="secret",
+            prompt_visibility=PromptVisibility.PRIVATE,
+        )
+        .run()
+    )
+    step = result.run.steps[0]
+    assert step.prompt_visibility == PromptVisibility.PRIVATE
+    assert "prompt_visibility" not in step.params
+
+
+def test_step_metadata_merges_into_step_field_not_params() -> None:
+    """metadata={...} must merge into Step.metadata, not Step.params (#53)."""
+    p = MockProvider()
+    result = (
+        Pipeline("metadata-test").step(p, model="m", prompt="p", metadata={"campaign": "c1"}).run()
+    )
+    step = result.run.steps[0]
+    assert step.metadata["campaign"] == "c1"
+    assert "metadata" not in step.params
+
+
+def test_step_metadata_preserved_alongside_graph_bookkeeping() -> None:
+    """Caller metadata must survive alongside internal _input_from graph
+    metadata — merging must not clobber either side (#53)."""
+    p = MockProvider()
+    result = (
+        Pipeline("metadata-fanin-test", chain=True)
+        .step(p, model="m1", prompt="p1")
+        .step(p, model="m2", prompt="p2", input_from=[0], metadata={"campaign": "c1"})
+        .run()
+    )
+    step = result.run.steps[1]
+    assert step.metadata["campaign"] == "c1"
+    assert step.metadata["_input_from"] == [0]
+
+
+def test_step_rejects_metadata_smuggled_through_params_dict() -> None:
+    """metadata= is a dedicated Step field — sneaking it in via params={} must
+    raise instead of silently persisting it as an opaque provider param (#53)."""
+    p = MockProvider()
+    with pytest.raises(GenblazeError, match="metadata"):
+        Pipeline("t").step(p, model="m", prompt="p", params={"metadata": {"x": 1}})
+
+
+def test_step_rejects_prompt_visibility_smuggled_through_params_dict() -> None:
+    p = MockProvider()
+    with pytest.raises(GenblazeError, match="prompt_visibility"):
+        Pipeline("t").step(p, model="m", prompt="p", params={"prompt_visibility": "private"})
+
+
+def test_step_rejects_metadata_colliding_with_reserved_graph_keys() -> None:
+    """Caller metadata must not silently clobber (or be clobbered by) the
+    internal _fallback_models/_input_from graph-bookkeeping keys (#53)."""
+    p = MockProvider()
+    with pytest.raises(GenblazeError, match="_fallback_models"):
+        Pipeline("t").step(
+            p,
+            model="m",
+            prompt="p",
+            fallback_models=["m2"],
+            metadata={"_fallback_models": ["not-mine"]},
+        )
+
+
+def test_step_rejects_non_provider_at_build_time() -> None:
+    """A plain function (e.g. chat()) must raise immediately at step(), not
+    surface as AttributeError deep inside run() (#224)."""
+
+    def chat(model: str, prompt: str) -> str:
+        return "hi"
+
+    with pytest.raises(TypeError, match="BaseProvider"):
+        Pipeline("t").step(chat, model="gpt-4o", prompt="say hi")
+
+
+def test_step_rejects_non_provider_names_the_bad_value() -> None:
+    """The error should name the offending function so the caller can find
+    the mistake without a traceback dive (#224)."""
+
+    def chat(model: str, prompt: str) -> str:
+        return "hi"
+
+    with pytest.raises(TypeError, match="chat"):
+        Pipeline("t").step(chat, model="gpt-4o", prompt="say hi")
+
+
+def test_step_rejects_non_provider_instance() -> None:
+    """Any non-BaseProvider object — not just functions — must be rejected."""
+    with pytest.raises(TypeError, match="BaseProvider"):
+        Pipeline("t").step(object(), model="m", prompt="p")
+
+
+def test_fallback_retry_preserves_caller_metadata() -> None:
+    """A model-fallback retry must not wipe caller metadata / _input_from —
+    _try_fallback_models() used to reassign fb_step.metadata wholesale (#53)."""
+    provider = ModelErrorProvider(failing_models={"bad-model"})
+    result = (
+        Pipeline("fallback-metadata-test")
+        .step(
+            provider,
+            model="bad-model",
+            prompt="p",
+            fallback_models=["good-model"],
+            metadata={"campaign": "c1"},
+        )
+        .run()
+    )
+    step = result.run.steps[0]
+    assert step.status == StepStatus.SUCCEEDED
+    assert step.metadata["campaign"] == "c1"
+    assert step.metadata["fallback_from"] == "bad-model"
+    assert step.metadata["fallback_model"] == "good-model"
+
+
+@pytest.mark.asyncio
+async def test_fallback_retry_preserves_caller_metadata_async() -> None:
+    """Async sibling of the sync fallback-metadata regression above.
+
+    _execute_step_async() inlines its own fallback loop (ainvoke requires
+    await) — a fix applied only to the sync path would leave this copy
+    silently reassigning fb_step.metadata wholesale (#53)."""
+    provider = ModelErrorProvider(failing_models={"bad-model"})
+    result = (
+        await Pipeline("fallback-metadata-test-async")
+        .step(
+            provider,
+            model="bad-model",
+            prompt="p",
+            fallback_models=["good-model"],
+            metadata={"campaign": "c1"},
+        )
+        .arun()
+    )
+    step = result.run.steps[0]
+    assert step.status == StepStatus.SUCCEEDED
+    assert step.metadata["campaign"] == "c1"
+    assert step.metadata["fallback_from"] == "bad-model"
+    assert step.metadata["fallback_model"] == "good-model"
+
+
+def test_input_from_failure_preserves_prompt_visibility() -> None:
+    """A step pre-failed by invalid input_from must still carry the caller's
+    prompt_visibility — _build_input_resolution_failure_step() used to build
+    the failed Step with the PromptVisibility default (PUBLIC), silently
+    dropping a PRIVATE prompt's redaction intent even though the failed Step
+    still carries the cleartext prompt (#53)."""
+    p0 = ChainableProvider()
+    p1 = ChainableProvider()
+
+    result = (
+        Pipeline("fan-in-visibility")
+        .step(p0, model="m0", prompt="zero")
+        .step(
+            p1,
+            model="m1",
+            prompt="one",
+            input_from=[5],
+            prompt_visibility=PromptVisibility.PRIVATE,
+        )
+        .run(fail_fast=False, raise_on_failure=False)
+    )
+
+    failed_step = result.run.steps[1]
+    assert failed_step.status == StepStatus.FAILED
+    assert failed_step.error_code == ProviderErrorCode.INVALID_INPUT
+    assert failed_step.prompt_visibility == PromptVisibility.PRIVATE
+
+
+def test_pipeline_metadata_merges_into_run_metadata() -> None:
+    """Pipeline.metadata(**kwargs) is additive across calls and lands on Run.metadata (#53)."""
+    p = MockProvider()
+    result = (
+        Pipeline("run-metadata-test")
+        .metadata(job="nightly")
+        .metadata(locale="en-US")
+        .step(p, model="m", prompt="p")
+        .run()
+    )
+    assert result.run.metadata == {"job": "nightly", "locale": "en-US"}
+
+
+def test_batch_run_items_routes_metadata_and_visibility_to_step_fields() -> None:
+    """batch_run(items=[{"metadata": ..., "prompt_visibility": ...}]) is a
+    second entry point into Step.params — it must route both to their
+    dedicated Step fields too, not just Pipeline.step() (#53)."""
+    p = MockProvider()
+    pipe = Pipeline("batch-metadata-test").step(p, model="m", prompt="base")
+    results = pipe.batch_run(
+        items=[
+            {
+                "prompt": "override",
+                "metadata": {"tag": "x"},
+                "prompt_visibility": PromptVisibility.PRIVATE,
+            }
+        ],
+        raise_on_failure=False,
+    )
+    step = results[0].run.steps[0]
+    assert step.metadata["tag"] == "x"
+    assert step.prompt_visibility == PromptVisibility.PRIVATE
+    assert "metadata" not in step.params
+    assert "prompt_visibility" not in step.params
+
+
+def test_batch_run_items_rejects_input_key() -> None:
+    """batch_run(items=...) must reject the same 'inputs'/'input' reserved
+    names as step() — it is a second, unguarded route into Step.params (#53)."""
+    p = MockProvider()
+    pipe = Pipeline("batch-input-guard").step(p, model="m", prompt="base")
+    with pytest.raises(GenblazeError, match="external_inputs"):
+        pipe.batch_run(items=[{"inputs": []}], raise_on_failure=False)
+
+
+def test_batch_run_items_rejects_metadata_colliding_with_reserved_graph_keys() -> None:
+    """batch_run(items=[{"metadata": {"_fallback_models": ...}}]) must raise,
+    not silently forge internal replay-data keys into Step.metadata (#53)."""
+    p = MockProvider()
+    pipe = Pipeline("batch-metadata-guard").step(
+        p, model="m", prompt="base", fallback_models=["m2"]
+    )
+    with pytest.raises(GenblazeError, match="_fallback_models"):
+        pipe.batch_run(
+            items=[{"metadata": {"_fallback_models": ["forged"]}}],
+            raise_on_failure=False,
+        )
 
 
 # -----------------------------------------------------------------------------

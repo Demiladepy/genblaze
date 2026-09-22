@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
@@ -30,6 +31,7 @@ from genblaze_core.exceptions import (
 )
 from genblaze_core.models.enums import (
     Modality,
+    PromptVisibility,
     ProviderErrorCode,
     RunStatus,
     StepStatus,
@@ -49,7 +51,7 @@ from genblaze_core.observability.events import (
 from genblaze_core.observability.tracer import LoggingTracer, NoOpTracer, Tracer, safe_call
 from genblaze_core.pipeline.moderation import ModerationHook, ModerationResult
 from genblaze_core.pipeline.result import PipelineResult, StepCompleteEvent
-from genblaze_core.pipeline.streaming import QueueEmitter, progress_to_stream_event
+from genblaze_core.pipeline.streaming import EmitterSlot, QueueEmitter, progress_to_stream_event
 from genblaze_core.progress_display import Spinner, should_auto_enable
 from genblaze_core.providers.base import BaseProvider
 from genblaze_core.providers.validation import ValidationOutcome, ValidationResult
@@ -82,10 +84,29 @@ _RAISE_ON_FAILURE_DEFAULT_FLIP_VERSION = "0.4.0"
 _TEXT_METADATA_KEY = "text"
 _MODERATION_SEGMENT_MAX_BYTES = 8 * 1024
 _MODERATION_TOTAL_MAX_BYTES = 32 * 1024
+# `inputs=`/`input=` is the natural-but-wrong name a caller trying to seed
+# Step.inputs would reach for — reserved across BOTH step()'s params={}/
+# **extra_params merge and batch_run(items=...)'s per-item dict, so it can't
+# be silently normalized as a model param on either entry point.
+_RESERVED_INPUT_PARAM_NAMES = ("inputs", "input")
+# Step-field kwargs that must never be smuggled through step()'s params={}
+# dict (see #53) — each has a dedicated top-level step() kwarg instead.
+_RESERVED_STEP_FIELD_PARAMS = ("metadata", "prompt_visibility")
+# Internal graph-bookkeeping keys _build_step_metadata() writes into
+# Step.metadata (fallback replay, fan-in routing). Caller-supplied
+# metadata= must not collide with these — see #53.
+_RESERVED_GRAPH_METADATA_KEYS = frozenset({"_fallback_models", "_input_from"})
 
 
 def _coerce_str(value: str | bytes | bytearray) -> str:
     return value if isinstance(value, str) else value.decode("utf-8", errors="replace")
+
+
+def _describe_step_provider_arg(value: Any) -> str:
+    """Describe a bad ``step(provider=...)`` argument for the TypeError message (#224)."""
+    if inspect.isfunction(value) or inspect.ismethod(value):
+        return f"function {value.__name__!r}"
+    return f"{type(value).__name__} instance"
 
 
 def _resolve_raise_on_failure(
@@ -118,6 +139,77 @@ def _resolve_raise_on_failure(
         stacklevel=3,
     )
     return False
+
+
+# batch_run()'s historical default — sync batch execution has always been
+# sequential regardless of max_concurrency (see _resolve_batch_max_concurrency).
+_BATCH_MAX_CONCURRENCY_DEFAULT = 5
+
+
+# Pipeline options that live on the constructor or a builder method rather than
+# on a run entry point. Passing one to run()/arun()/batch_run()/abatch_run()
+# raised a bare "unexpected keyword argument", which names neither the right
+# call site nor the right spelling — the only way out was to read the source.
+# Each value completes the sentence "... — <hint>."
+#
+# Names that ARE real parameters of a given entry point never reach this table:
+# Python binds them normally, so they are never collected into **unsupported.
+# That is why ``max_concurrency`` can be listed here — it only fires on run(),
+# the one entry point that does not take it.
+_MISPLACED_RUN_KWARGS: dict[str, str] = {
+    "cache": "caching is configured on the pipeline: .cache(StepCache(...))",
+    "config": "per-run config is set with .config({...})",
+    "metadata": (
+        "run metadata is set with .metadata(key=value); for step metadata use "
+        ".step(..., metadata={...})"
+    ),
+    "tracer": "a tracer is attached with .tracer(...) or Pipeline(..., tracer=...)",
+    "preflight": ("preflight is toggled with .preflight(False) or Pipeline(..., preflight=False)"),
+    "tenant_id": "the tenant is set on the pipeline: Pipeline(..., tenant_id=...)",
+    "project_id": "the project is set on the pipeline: Pipeline(..., project_id=...)",
+    "chain": "chaining is set on the pipeline: Pipeline(..., chain=...)",
+    "moderation": "moderation is set on the pipeline: Pipeline(..., moderation=...)",
+    "structured_log": (
+        "structured logging is set on the pipeline: Pipeline(..., structured_log=...)"
+    ),
+    "max_concurrency": (
+        "run() is sequential; use arun()/abatch_run() for concurrency, or set the "
+        "default with Pipeline(..., max_concurrency=...)"
+    ),
+}
+
+
+def _resolve_batch_max_concurrency(max_concurrency: int | None) -> int:
+    """Resolve ``batch_run()``'s ``max_concurrency``, warning only when the
+    caller explicitly overrides the silent sequential default (issue #83).
+
+    Sync ``batch_run()`` always executes items sequentially — provider
+    adapters and sinks are not guaranteed thread-safe under real OS-thread
+    parallelism (batch clones share the same provider/sink instances), so
+    genuine concurrency is deliberately NOT implemented here; use
+    ``abatch_run()`` instead. ``max_concurrency=None`` (the caller didn't pass
+    it) silently resolves to the historical default so the overwhelming
+    majority of existing call sites see no behavior change and no warning.
+    Any EXPLICIT value — including literally the same default — is a
+    deliberate ask for concurrency the sync path can't provide, so it warns
+    once, mirroring the ``None``-sentinel convention ``_resolve_raise_on_failure``
+    already uses in this file.
+    """
+    if max_concurrency is None:
+        return _BATCH_MAX_CONCURRENCY_DEFAULT
+    if max_concurrency < 1:
+        raise GenblazeError(f"max_concurrency must be >= 1, got {max_concurrency}")
+    import warnings
+
+    warnings.warn(
+        "Pipeline.batch_run() executes items sequentially regardless of "
+        "max_concurrency — provider/sink objects are not guaranteed thread-safe "
+        "under real concurrent execution. Use Pipeline.abatch_run() for genuine "
+        "concurrent batch execution.",
+        UserWarning,
+        stacklevel=3,
+    )
+    return max_concurrency
 
 
 def _maybe_raise_pipeline_error(
@@ -284,6 +376,12 @@ class _PipelineStep:
     # Caller-supplied ETA hint surfaced on StepStartedEvent so consumers can
     # render meaningful progress UIs without hard-coding per-model duration.
     expected_duration_sec: float | None = None
+    # Caller-supplied Step.metadata / Step.prompt_visibility (see #53). Kept
+    # as first-class fields rather than swallowed into params — the latter
+    # silently defaulted every step's prompt_visibility to PUBLIC regardless
+    # of what the caller passed, a privacy footgun.
+    metadata: dict[str, Any] | None = None
+    prompt_visibility: PromptVisibility = PromptVisibility.PUBLIC
 
 
 @dataclass(frozen=True)
@@ -360,6 +458,25 @@ class Pipeline(Runnable[None, PipelineResult]):
         # mutate it concurrently from different worker threads.
         self._warned_preflight: set[tuple[str, str]] = set()
         self._warned_preflight_lock = threading.Lock()
+        # Arbitrary caller metadata merged into Run.metadata at _finalize()
+        # time via Pipeline.metadata(**kwargs) (see #53). Additive across
+        # calls, mirroring RunBuilder.meta()'s dict.update() semantics.
+        self._run_metadata: dict[str, Any] = {}
+        # Holds the "active" stream emitter for whichever thread/task is
+        # currently inside stream()/astream()'s worker. ContextVar-backed
+        # (not a plain mutable instance attribute) so concurrent
+        # stream()/astream() calls on the SAME Pipeline instance don't
+        # cross-deliver events (#79, #84). See EmitterSlot's docstring for
+        # why this needs no additional locking.
+        #
+        # Built fresh per instance (NOT a class-level singleton) so a
+        # DIFFERENT Pipeline instance run synchronously inside this one's
+        # stream()/astream() worker (e.g. from a step provider, moderation
+        # hook, or callback) never observes this instance's emitter — a
+        # single shared ContextVar isolates concurrent calls on one instance
+        # but does nothing to isolate distinct instances sharing the same
+        # thread/task Context (#151).
+        self._emitter_slot = EmitterSlot("genblaze_pipeline_emitter")
         # Tracer resolution: explicit arg wins; legacy structured_log=True maps
         # to LoggingTracer so existing callers keep their JSON event stream.
         if tracer is not None:
@@ -368,7 +485,6 @@ class Pipeline(Runnable[None, PipelineResult]):
             self._tracer = LoggingTracer()
         else:
             self._tracer = NoOpTracer()
-        self._event_emitter: QueueEmitter | None = None
 
     # --- Copy / serialization protocols ---------------------------------
     # The WARN-dedup ``threading.Lock`` added for #56 is neither copyable nor
@@ -379,22 +495,45 @@ class Pipeline(Runnable[None, PipelineResult]):
     #     independent clone with a freshly built lock.
     # Defining __copy__ is required: without it, __getstate__/__setstate__
     # would also drive copy.copy and silently break the shared-lock contract.
+    #
+    # ``_emitter_slot`` is handled differently from the lock/dedup-set: EVERY
+    # protocol gives the clone a brand-new ``EmitterSlot``, never a shared one
+    # (also unpicklable, like the lock, but unlike the lock there's no known
+    # use case for sharing it). A shallow ``copy.copy`` clone that shared the
+    # slot would reintroduce #151's leak in a narrower shape — a
+    # batch_run()/abatch_run() clone executing .run()/.arun() inside the same
+    # thread/task Context as the pipeline that spawned it (e.g. batch_run()
+    # invoked from a hook running inside this instance's own stream() worker)
+    # would read this instance's emitter through the shared ContextVar and
+    # leak its events into the same queue.
 
     def __copy__(self) -> Pipeline:
-        """Shallow copy that shares the WARN-dedup lock and set across clones."""
+        """Shallow copy that shares the WARN-dedup lock and set across clones.
+
+        The stream emitter slot is deliberately NOT shared — see the comment
+        above the copy/serialization protocols block. ``_run_metadata`` also
+        gets an independent dict (not the shared-by-reference default a plain
+        ``__dict__.update()`` would give it) so a batch_run()/abatch_run()
+        clone calling ``.metadata(...)`` on itself can never mutate the
+        metadata the pipeline that spawned it will see.
+        """
         clone = self.__class__.__new__(self.__class__)
         clone.__dict__.update(self.__dict__)
+        clone._emitter_slot = EmitterSlot("genblaze_pipeline_emitter")
+        clone._run_metadata = dict(self._run_metadata)
         return clone
 
     def __getstate__(self) -> dict:
-        """Omit the unpicklable lock for pickle/deepcopy; rebuilt in setstate."""
+        """Omit the unpicklable lock/emitter slot for pickle/deepcopy; rebuilt in setstate."""
         state = self.__dict__.copy()
         state.pop("_warned_preflight_lock", None)
+        state.pop("_emitter_slot", None)
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self._warned_preflight_lock = threading.Lock()
+        self._emitter_slot = EmitterSlot("genblaze_pipeline_emitter")
 
     @staticmethod
     def _reject_config_tenant(cfg: RunnableConfig | None) -> None:
@@ -411,6 +550,23 @@ class Pipeline(Runnable[None, PipelineResult]):
                 "RunnableConfig does not support 'tenant_id'. Set the tenant on "
                 "the pipeline instead: Pipeline(..., tenant_id=...) (see #68)."
             )
+
+    @staticmethod
+    def _reject_unsupported_run_kwargs(method: str, kwargs: dict[str, Any]) -> None:
+        """Reject unknown keyword arguments to a run entry point.
+
+        Python's own error for a misplaced option (``run(cache=...)``) is
+        ``got an unexpected keyword argument 'cache'`` — correct but a dead
+        end, because pipeline configuration is split across the constructor,
+        the fluent builders, and the run entry points with no rule the caller
+        can guess. For the options in ``_MISPLACED_RUN_KWARGS`` the error now
+        names the call site that does work; everything else keeps CPython's
+        exact wording so existing expectations still match.
+        """
+        for name in kwargs:
+            base = f"Pipeline.{method}() got an unexpected keyword argument {name!r}"
+            hint = _MISPLACED_RUN_KWARGS.get(name)
+            raise TypeError(f"{base} — {hint}." if hint else base)
 
     def config(self, cfg: RunnableConfig) -> Pipeline:
         self._reject_config_tenant(cfg)
@@ -451,6 +607,21 @@ class Pipeline(Runnable[None, PipelineResult]):
         to the previous iteration. Does not affect the canonical hash.
         """
         self._parent_run_id = result.run.run_id
+        return self
+
+    def metadata(self, **kwargs: Any) -> Pipeline:
+        """Attach arbitrary metadata to the resulting ``Run`` (issue #53).
+
+        Additive across calls (``dict.update()`` semantics, matching
+        ``RunBuilder.meta()``) — call multiple times to layer on more keys
+        rather than replacing what's already set. Merged into ``Run.metadata``
+        at ``.run()``/``.arun()`` time via ``RunBuilder.meta()``.
+
+        For per-step metadata (campaign, SKU, reviewer, ...), use
+        ``Pipeline.step(..., metadata={...})`` instead — this method is
+        run-scoped, not step-scoped.
+        """
+        self._run_metadata.update(kwargs)
         return self
 
     @classmethod
@@ -531,7 +702,10 @@ class Pipeline(Runnable[None, PipelineResult]):
         input_from: list[int] | int | None = None,
         external_inputs: list[Asset] | None = None,
         expected_duration_sec: float | None = None,
-        **params,
+        metadata: dict[str, Any] | None = None,
+        prompt_visibility: PromptVisibility = PromptVisibility.PUBLIC,
+        params: dict[str, Any] | None = None,
+        **extra_params: Any,
     ) -> Pipeline:
         """Add a step to the pipeline.
 
@@ -549,19 +723,79 @@ class Pipeline(Runnable[None, PipelineResult]):
                 UIs. The SDK does not synthesize this — supply your own median
                 from observed runs. Stale values produce worse UX than
                 omitting the field; treat as informational.
+            metadata: Arbitrary caller metadata (campaign, SKU, locale,
+                reviewer, correlation id, ...) merged into ``Step.metadata``
+                alongside internal pipeline-graph bookkeeping (fallback/
+                input-routing replay data). Raises if a key collides with a
+                reserved internal key (issue #53).
+            prompt_visibility: Prompt redaction level persisted on the built
+                ``Step`` (default ``PUBLIC``). Controls whether the prompt is
+                cached/embedded in cleartext — set ``PRIVATE`` for
+                privacy-sensitive prompts (issue #53).
+            params: Provider-specific parameters as a dict. Equivalent to
+                passing the same keys as top-level kwargs — use whichever
+                reads better at the call site. If a key appears in both,
+                the top-level kwarg wins (issue #133).
+            **extra_params: Provider-specific parameters as top-level kwargs
+                (e.g. ``duration=10``). Merged with ``params=`` above.
         """
-        # Reject reserved param names that would silently land in **params.
+        # Fail immediately, at the mistake, rather than at run() with a
+        # bare AttributeError on an internal method name (#224). The most
+        # common miss is passing a standalone chat()/achat() function —
+        # those are convenience helpers, not BaseProvider instances.
+        # Deliberately TypeError, not GenblazeError like the sibling guards
+        # below (reserved-param names, metadata collisions) — this rejects
+        # the argument's *type*, not a value/usage mistake within an
+        # otherwise-valid call, matching the same distinction already drawn
+        # in canonical/_normalize.py and models/chat.py.
+        if not isinstance(provider, BaseProvider):
+            raise TypeError(
+                f"step() expected a BaseProvider; got {_describe_step_provider_arg(provider)}. "
+                "chat()/achat() are convenience helpers, not pipeline steps — wrap them in "
+                "a SyncProvider to record them as a step (see docs/features/llm-calls.md)."
+            )
+
+        # Explicit params= dict and **extra_params kwargs both feed
+        # Step.params; kwargs win on key collision since they're the more
+        # specific, call-site-local override.
+        merged_params: dict[str, Any] = dict(params) if params else {}
+        merged_params.update(extra_params)
+
+        # Reject reserved param names that would silently land in Step.params.
         # `inputs=` / `input=` is the natural-but-wrong name a user trying to
         # seed Step.inputs would reach for; without this guard they get
-        # swallowed by **params, normalized as a model param, and either
+        # swallowed into params, normalized as a model param, and either
         # rejected by the upstream provider or — worse — embedded in the
         # manifest as part of Step.params, drifting the canonical hash.
-        for reserved in ("inputs", "input"):
-            if reserved in params:
+        for reserved in _RESERVED_INPUT_PARAM_NAMES:
+            if reserved in merged_params:
                 raise GenblazeError(
                     f"'{reserved}=' is not a valid step() kwarg — did you mean "
                     f"'external_inputs=' (a list of caller-held Assets)? See "
                     f"docs/features/pipelines.md for the three input mechanisms."
+                )
+        # `metadata=`/`prompt_visibility=` are dedicated top-level kwargs above
+        # (they never land in **extra_params), but a caller could still smuggle
+        # them through params={...} — reject that too instead of silently
+        # persisting them as opaque provider params (#53).
+        for reserved in _RESERVED_STEP_FIELD_PARAMS:
+            if reserved in merged_params:
+                raise GenblazeError(
+                    f"'{reserved}=' inside params={{}} is not supported — it's a "
+                    f"dedicated Step field. Pass Pipeline.step({reserved}=...) as a "
+                    f"top-level kwarg instead."
+                )
+        # Caller metadata must not collide with the internal graph-bookkeeping
+        # keys _build_step_metadata() writes (fallback/input-routing replay
+        # data) — silently letting either side clobber the other would either
+        # corrupt replay data or swallow the caller's metadata (#53).
+        if metadata:
+            collision = _RESERVED_GRAPH_METADATA_KEYS & metadata.keys()
+            if collision:
+                raise GenblazeError(
+                    f"metadata key(s) {sorted(collision)} are reserved for internal "
+                    "pipeline bookkeeping (fallback/input-routing replay data). "
+                    "Rename your metadata key(s)."
                 )
         # Normalize scalar index to list for uniform handling
         normalized_from: list[int] | None = None
@@ -600,13 +834,15 @@ class Pipeline(Runnable[None, PipelineResult]):
                 provider=provider,
                 model=model,
                 prompt=prompt,
-                params=params,
+                params=merged_params,
                 modality=modality,
                 step_type=step_type,
                 fallback_models=fallback_models or [],
                 input_from=normalized_from,
                 external_inputs=normalized_external,
                 expected_duration_sec=expected_duration_sec,
+                metadata=metadata,
+                prompt_visibility=prompt_visibility,
             )
         )
         return self
@@ -916,6 +1152,7 @@ class Pipeline(Runnable[None, PipelineResult]):
             started_at=now,
             completed_at=now,
             metadata=metadata,
+            prompt_visibility=ps.prompt_visibility,
         )
         if step_id is not None:
             step_kwargs["step_id"] = step_id
@@ -966,8 +1203,16 @@ class Pipeline(Runnable[None, PipelineResult]):
         return step
 
     def _build_step_metadata(self, ps: _PipelineStep) -> dict[str, Any]:
-        """Build persisted pipeline graph metadata for a deferred step."""
-        metadata: dict[str, Any] = {}
+        """Build persisted Step metadata: caller-supplied ``metadata=`` (#53)
+        merged with internal pipeline graph bookkeeping (fallback replay,
+        fan-in routing).
+
+        Graph keys are applied last so they always win on a collision that
+        somehow bypassed ``step()``'s reserved-key guard (e.g. a directly
+        constructed ``_PipelineStep``) — fallback/input-routing replay
+        correctness must never be silently corrupted by caller data.
+        """
+        metadata: dict[str, Any] = dict(ps.metadata) if ps.metadata else {}
         if ps.fallback_models:
             metadata["_fallback_models"] = ps.fallback_models
         if ps.input_from is not None:
@@ -1026,6 +1271,7 @@ class Pipeline(Runnable[None, PipelineResult]):
             status=StepStatus.PENDING,
             inputs=inputs or [],
             metadata=metadata,
+            prompt_visibility=ps.prompt_visibility,
         )
         if step_id is not None:
             step_kwargs["step_id"] = step_id
@@ -1073,10 +1319,16 @@ class Pipeline(Runnable[None, PipelineResult]):
                 logger.info("Falling back from %s to %s", step.model, fb_model)
                 fb_step = self._build_step(ps, step.inputs or None)
                 fb_step.model = fb_model
-                fb_step.metadata = {
-                    "fallback_from": original_model,
-                    "fallback_model": fb_model,
-                }
+                # .update(), not reassignment — fb_step.metadata already
+                # carries caller metadata= and the _input_from graph key from
+                # _build_step(); replacing it wholesale would silently drop
+                # both on a fallback retry (#53).
+                fb_step.metadata.update(
+                    {
+                        "fallback_from": original_model,
+                        "fallback_model": fb_model,
+                    }
+                )
                 result = invoke_fn(fb_step, config)
                 if result.status == StepStatus.SUCCEEDED:
                     cache_key_step = fb_step
@@ -1226,10 +1478,14 @@ class Pipeline(Runnable[None, PipelineResult]):
                     logger.info("Falling back from %s to %s", step.model, fb_model)
                     fb_step = self._build_step(ps, step.inputs or None)
                     fb_step.model = fb_model
-                    fb_step.metadata = {
-                        "fallback_from": original_model,
-                        "fallback_model": fb_model,
-                    }
+                    # .update(), not reassignment — see the sync fallback
+                    # path (_try_fallback_models) for why (#53).
+                    fb_step.metadata.update(
+                        {
+                            "fallback_from": original_model,
+                            "fallback_model": fb_model,
+                        }
+                    )
                     result = await ps.provider.ainvoke(fb_step, config)
                     if result.status == StepStatus.SUCCEEDED:
                         cache_key_step = fb_step
@@ -1275,8 +1531,17 @@ class Pipeline(Runnable[None, PipelineResult]):
         sink: BaseSink | None,
         run_id: str,
         started_at_ts: float | None = None,
+        *,
+        force_status: RunStatus | None = None,
     ) -> PipelineResult:
-        """Build run, manifest, and write to sink."""
+        """Build run, manifest, and write to sink.
+
+        ``force_status`` overrides the inferred COMPLETED/FAILED status.
+        Used by run()/arun()'s exception fallback so a run that aborted
+        before reaching normal completion is never reported as COMPLETED,
+        regardless of how many of its steps happened to succeed before the
+        abort (#85).
+        """
         builder = RunBuilder(self._name)
         builder.run_id(run_id)
         if self._tenant_id:
@@ -1285,12 +1550,17 @@ class Pipeline(Runnable[None, PipelineResult]):
             builder.project(self._project_id)
         if self._parent_run_id:
             builder.parent(self._parent_run_id)
+        if self._run_metadata:
+            builder.meta(**self._run_metadata)
 
         all_succeeded = all(s.status == StepStatus.SUCCEEDED for s in completed_steps)
         for s in completed_steps:
             builder.add_step(s)
 
-        builder.status(RunStatus.COMPLETED if all_succeeded else RunStatus.FAILED)
+        if force_status is not None:
+            builder.status(force_status)
+        else:
+            builder.status(RunStatus.COMPLETED if all_succeeded else RunStatus.FAILED)
         run_obj = builder.build()
 
         if started_at_ts is not None:
@@ -1331,14 +1601,20 @@ class Pipeline(Runnable[None, PipelineResult]):
             logger.warning("%s callback raised", name, exc_info=True)
 
     def attach_emitter(self, emitter: QueueEmitter | None) -> QueueEmitter | None:
-        """Install (or clear) the stream event emitter, returning the prior one.
+        """Install (or clear) the stream event emitter for the calling
+        thread/task, returning the prior one.
 
-        Public so composable runners (e.g. AgentLoop) can pipe pipeline events
-        into their own event stream without poking private state.
+        Storage is ``_emitter_slot`` (contextvars-backed), not an instance
+        attribute — isolating concurrent stream()/astream() calls on the
+        same Pipeline instance from each other (#79, #84). Public so
+        composable runners (e.g. AgentLoop) can pipe pipeline events into
+        their own event stream without poking private state.
         """
-        prior = self._event_emitter
-        self._event_emitter = emitter
-        return prior
+        return self._emitter_slot.set(emitter)
+
+    @property
+    def _event_emitter(self) -> QueueEmitter | None:
+        return self._emitter_slot.get()
 
     def _install_progress_tracer(
         self,
@@ -1443,8 +1719,11 @@ class Pipeline(Runnable[None, PipelineResult]):
     def _emit_step_complete_event(self, step_event: StepCompleteEvent, run_id: str) -> None:
         # Tracer on_step_end is paired in _execute_step, _execute_step_async,
         # and _record_prefailed_step via _emit_tracer_step_end; emitter-only here.
+        # run_id is passed explicitly rather than relying on the emitter's own
+        # (never-set) run_id — stream()/astream() build the emitter before
+        # the run id exists (#87).
         if self._event_emitter is not None:
-            self._event_emitter.on_step_complete(step_event)
+            self._event_emitter.on_step_complete(step_event, run_id)
 
     def _notify_sink_step_complete(
         self,
@@ -1480,7 +1759,15 @@ class Pipeline(Runnable[None, PipelineResult]):
                 exc,
             )
 
-    def _emit_pipeline_end(self, result: PipelineResult, run_id: str) -> None:
+    def _emit_pipeline_end(
+        self, result: PipelineResult, run_id: str, *, message: str | None = None
+    ) -> None:
+        """Emit the terminal pipeline event.
+
+        ``message`` overrides the step-derived ``error_summary()`` — used by
+        run()/arun()'s exception fallback to surface the abort reason (e.g.
+        a timeout) even when no step recorded an error (#85).
+        """
         failed = result.run.status == RunStatus.FAILED
         # Pre-compute wire-safe fields so consumers of to_dict() / JSON Schema
         # still see terminal status + manifest hash when the in-process
@@ -1491,7 +1778,7 @@ class Pipeline(Runnable[None, PipelineResult]):
             event: StreamEvent = PipelineFailedEvent(
                 run_id=run_id,
                 result=result,
-                message=result.error_summary(),
+                message=message if message is not None else result.error_summary(),
                 run_status=run_status,
                 manifest_hash=manifest_hash,
             )
@@ -1531,8 +1818,12 @@ class Pipeline(Runnable[None, PipelineResult]):
         Early break: if the caller breaks out of iteration before the
         terminal event, we return immediately and let the (daemon) worker
         thread finish in the background. Remaining events are discarded
-        and any post-break exception in the pipeline is suppressed.
+        and any post-break exception in the pipeline is suppressed. The
+        emitter is closed as soon as we detect the early break, so the
+        abandoned worker's remaining ``put()`` calls become no-ops instead
+        of piling onto a queue nobody will ever drain (#74).
         """
+        import contextvars
         import queue as _queue
         import threading
 
@@ -1540,12 +1831,15 @@ class Pipeline(Runnable[None, PipelineResult]):
 
         q: _queue.Queue = _queue.Queue()
         emitter = QueueEmitter(q, include_heartbeats=heartbeats)
-        prior = self.attach_emitter(emitter)
 
         exc_box: list[BaseException] = []
         done = threading.Event()
 
         def _worker() -> None:
+            # Installed inside the worker thread so it lands in this
+            # thread's own Context — isolated from a concurrent stream()
+            # call's worker thread on the same Pipeline instance (#84).
+            self.attach_emitter(emitter)
             try:
                 self.run(**run_kwargs)
             except BaseException as exc:  # noqa: BLE001 — propagate via queue
@@ -1554,18 +1848,29 @@ class Pipeline(Runnable[None, PipelineResult]):
                 emitter.close()
                 done.set()
 
-        t = threading.Thread(target=_worker, daemon=True, name="genblaze-stream")
+        # Run the worker inside its own throwaway Context — the same trick
+        # asyncio.create_task() already gets for free — so the attach_emitter
+        # install above can never leak onto the underlying OS thread itself.
+        # Safe today regardless (a fresh Thread's default context is already
+        # empty), but this keeps correctness structural rather than
+        # incidental if a future caller ever reuses worker threads via a
+        # pooled executor instead of spawning one per stream() call.
+        ctx = contextvars.copy_context()
+        t = threading.Thread(target=ctx.run, args=(_worker,), daemon=True, name="genblaze-stream")
         t.start()
         try:
             yield from drain_queue_sync(q)
         finally:
-            self.attach_emitter(prior)
             if done.is_set():
                 t.join()  # fast — worker already returned
                 if exc_box:
                     raise exc_box[0]
-            # else: consumer broke early; worker keeps running as a daemon
-            # thread and exits when the pipeline naturally completes.
+            else:
+                # Consumer broke early; the worker keeps running as a
+                # daemon thread until the pipeline naturally completes, but
+                # close the emitter now so it stops enqueuing further
+                # events (#74).
+                emitter.close()
 
     async def astream(self, *, heartbeats: bool = True, **run_kwargs: Any):
         """Async version of :meth:`stream`.
@@ -1575,15 +1880,20 @@ class Pipeline(Runnable[None, PipelineResult]):
 
         Early break: cancels the worker task so in-flight provider calls
         unwind at their next await point. Any post-break exception from
-        the pipeline is suppressed.
+        the pipeline is suppressed. The emitter is closed before
+        cancellation so any event racing the cancel becomes a no-op instead
+        of reaching an abandoned queue (#74).
         """
         from genblaze_core.pipeline.streaming import drain_queue_async
 
         q: asyncio.Queue = asyncio.Queue()
         emitter = QueueEmitter(q, include_heartbeats=heartbeats)
-        prior = self.attach_emitter(emitter)
 
         async def _worker() -> None:
+            # Installed inside the task's own (copied) context — isolated
+            # from a concurrent astream() call's task on the same Pipeline
+            # instance (#84).
+            self.attach_emitter(emitter)
             try:
                 await self.arun(**run_kwargs)
             finally:
@@ -1594,10 +1904,12 @@ class Pipeline(Runnable[None, PipelineResult]):
             async for ev in drain_queue_async(q):
                 yield ev
         finally:
-            self.attach_emitter(prior)
             if task.done():
                 await task  # re-raises if worker failed
             else:
+                # Consumer broke early — close first so anything racing the
+                # cancellation becomes a no-op (#74), then cancel the worker.
+                emitter.close()
                 task.cancel()
                 try:
                     await task
@@ -1652,6 +1964,7 @@ class Pipeline(Runnable[None, PipelineResult]):
         on_retry: Any = None,
         _config_override: RunnableConfig | None = None,
         _owns_sink: bool = True,
+        **unsupported: Any,
     ) -> PipelineResult:
         """Execute all steps synchronously and return a PipelineResult.
 
@@ -1684,9 +1997,13 @@ class Pipeline(Runnable[None, PipelineResult]):
                 synchronous side-effect alongside (e.g., metrics).
 
         Raises:
+            TypeError: If an unknown keyword argument is passed. Options that
+                belong on the constructor or a builder (``cache``, ``config``,
+                ``tracer``, …) get an error naming the call site that works.
             GenblazeError: If no steps have been added to the pipeline.
             GenblazeError: If pipeline_timeout is exceeded.
         """
+        self._reject_unsupported_run_kwargs("run", unsupported)
         if not self._steps:
             msg = "Pipeline has no steps. Add steps with .step() before calling .run()."
             raise GenblazeError(msg)
@@ -1751,6 +2068,7 @@ class Pipeline(Runnable[None, PipelineResult]):
         completed_steps: list[Step] = []
         prev_assets: list[Asset] = []
         pipeline_result: PipelineResult | None = None
+        abort_message: str | None = None
         try:
             for i, ps in enumerate(self._steps, 1):
                 # Check pipeline-level timeout before each step
@@ -1833,13 +2151,27 @@ class Pipeline(Runnable[None, PipelineResult]):
             should_raise = _resolve_raise_on_failure(raise_on_failure)
             _maybe_raise_pipeline_error(pipeline_result, completed_steps, should_raise)
             return pipeline_result
+        except BaseException as exc:
+            # Only stash a synthetic abort message when _finalize never ran
+            # for this run (pipeline_result still None) — e.g. a mid-loop
+            # PipelineTimeoutError. A PipelineError raised by
+            # _maybe_raise_pipeline_error AFTER a normal _finalize already
+            # carries accurate step-level errors via error_summary().
+            if pipeline_result is None:
+                abort_message = sanitize_error(str(exc))
+            raise
         finally:
             # Guarantee on_run_end fires — covers timeouts, KeyboardInterrupt,
-            # and bugs in _finalize. Synthesizes an aborted result if the
-            # normal flow didn't reach _finalize.
+            # and bugs in _finalize. A run that aborted before _finalize is
+            # always reported FAILED here, never inferred as COMPLETED from
+            # an empty or all-succeeded step prefix (#85).
             self._emit_pipeline_end(
-                pipeline_result or self._finalize(completed_steps, None, run_id, started_at_ts),
+                pipeline_result
+                or self._finalize(
+                    completed_steps, None, run_id, started_at_ts, force_status=RunStatus.FAILED
+                ),
                 run_id,
+                message=abort_message,
             )
             if spinner is not None:
                 spinner.stop()
@@ -1868,6 +2200,7 @@ class Pipeline(Runnable[None, PipelineResult]):
         on_retry: Any = None,
         _config_override: RunnableConfig | None = None,
         _owns_sink: bool = True,
+        **unsupported: Any,
     ) -> PipelineResult:
         """Execute steps asynchronously and return a PipelineResult.
 
@@ -1898,9 +2231,12 @@ class Pipeline(Runnable[None, PipelineResult]):
                 :meth:`astream` consumers.
 
         Raises:
+            TypeError: If an unknown keyword argument is passed — see
+                :meth:`run`.
             GenblazeError: If no steps have been added to the pipeline.
             GenblazeError: If pipeline_timeout is exceeded.
         """
+        self._reject_unsupported_run_kwargs("arun", unsupported)
         if not self._steps:
             msg = "Pipeline has no steps. Add steps with .step() before calling .arun()."
             raise GenblazeError(msg)
@@ -1965,6 +2301,7 @@ class Pipeline(Runnable[None, PipelineResult]):
         self._emit_run_start(run_id, total_steps)
         completed_steps: list[Step] = []
         pipeline_result: PipelineResult | None = None
+        abort_message: str | None = None
         try:
             if sequential:
                 # Sequential: each step's outputs feed the next step's inputs.
@@ -2059,13 +2396,11 @@ class Pipeline(Runnable[None, PipelineResult]):
                 steps_and_models = [
                     (ps, self._build_step(ps, ps.external_inputs)) for ps in self._steps
                 ]
-                for idx, (ps, step) in enumerate(steps_and_models):
-                    self._emit_step_start(
-                        _StepContext(run_id=run_id, step_index=idx, total_steps=total_steps),
-                        step,
-                        ps,
-                    )
 
+                # Check the pipeline timeout BEFORE announcing any step —
+                # otherwise a run that never actually starts a step still
+                # emits step.started, making an aborted run look like it was
+                # underway (#85).
                 if pipeline_timeout is not None:
                     elapsed = time.monotonic() - started_at_mono
                     if elapsed >= pipeline_timeout:
@@ -2074,6 +2409,13 @@ class Pipeline(Runnable[None, PipelineResult]):
                             f" (limit: {pipeline_timeout}s)"
                         )
                         raise PipelineTimeoutError(msg)
+
+                for idx, (ps, step) in enumerate(steps_and_models):
+                    self._emit_step_start(
+                        _StepContext(run_id=run_id, step_index=idx, total_steps=total_steps),
+                        step,
+                        ps,
+                    )
 
                 concurrency = max_concurrency or self._max_concurrency
                 sem = asyncio.Semaphore(concurrency) if concurrency else None
@@ -2167,12 +2509,28 @@ class Pipeline(Runnable[None, PipelineResult]):
             should_raise = _resolve_raise_on_failure(raise_on_failure)
             _maybe_raise_pipeline_error(pipeline_result, completed_steps, should_raise)
             return pipeline_result
+        except BaseException as exc:
+            # Only stash a synthetic abort message when _finalize never ran
+            # for this run (pipeline_result still None) — e.g. a mid-loop
+            # PipelineTimeoutError or fail-fast cancellation. A
+            # PipelineError raised by _maybe_raise_pipeline_error AFTER a
+            # normal _finalize already carries accurate step-level errors
+            # via error_summary().
+            if pipeline_result is None:
+                abort_message = sanitize_error(str(exc))
+            raise
         finally:
             # Guarantee on_run_end fires — covers timeouts, cancellation,
-            # and bugs in _finalize. Synthesizes a result if we didn't reach it.
+            # and bugs in _finalize. A run that aborted before _finalize is
+            # always reported FAILED here, never inferred as COMPLETED from
+            # an empty or all-succeeded step prefix (#85).
             self._emit_pipeline_end(
-                pipeline_result or self._finalize(completed_steps, None, run_id, started_at_ts),
+                pipeline_result
+                or self._finalize(
+                    completed_steps, None, run_id, started_at_ts, force_status=RunStatus.FAILED
+                ),
                 run_id,
+                message=abort_message,
             )
             if spinner is not None:
                 spinner.stop()
@@ -2185,13 +2543,20 @@ class Pipeline(Runnable[None, PipelineResult]):
             if _owns_sink:
                 await asyncio.to_thread(self._close_sink_quietly, sink)
 
-    def _make_failed_step(self, ps: _PipelineStep, exc: Exception) -> Step:
-        """Create a FAILED step from an unhandled exception."""
+    def _make_failed_step(
+        self, ps: _PipelineStep, exc: Exception, *, step_id: str | None = None
+    ) -> Step:
+        """Create a FAILED step from an unhandled exception.
+
+        ``step_id`` preserves correlation with an already-emitted
+        ``step.started`` event (concurrent fail-fast path, #86); omit to
+        mint a fresh id.
+        """
         from genblaze_core.providers.base import classify_api_error
 
         # Preserve external_inputs on the failed-step record so the manifest
         # shows what the step was supposed to consume.
-        step = self._build_step(ps, ps.external_inputs)
+        step = self._build_step(ps, ps.external_inputs, step_id=step_id)
         step.status = StepStatus.FAILED
         step.error = sanitize_error(str(exc))
         step.error_code = classify_api_error(exc)
@@ -2211,6 +2576,11 @@ class Pipeline(Runnable[None, PipelineResult]):
         tasks: list[asyncio.Task] = []
         task_index: dict[asyncio.Task, int] = {}
         task_ps: dict[asyncio.Task, _PipelineStep] = {}
+        # The already-built Step for each task, carrying the step_id that
+        # was announced via step.started. Cancellation/exception placeholders
+        # must reuse this id rather than minting a new one, or the later
+        # step.failed event won't correlate with its own step.started (#86).
+        task_step: dict[asyncio.Task, Step] = {}
 
         async def _run(ps: _PipelineStep, step: Step) -> Step:
             if semaphore:
@@ -2234,6 +2604,7 @@ class Pipeline(Runnable[None, PipelineResult]):
             tasks.append(t)
             task_index[t] = idx
             task_ps[t] = ps
+            task_step[t] = step
 
         results: dict[int, Step] = {}
         pending: set[asyncio.Task] = set(tasks)
@@ -2248,7 +2619,7 @@ class Pipeline(Runnable[None, PipelineResult]):
                 except Exception as exc:
                     # Task raised — create a FAILED step instead of dropping it
                     logger.debug("Task %d raised an exception: %s", idx, exc)
-                    result = self._make_failed_step(task_ps[t], exc)
+                    result = self._make_failed_step(task_ps[t], exc, step_id=task_step[t].step_id)
 
                 results[idx] = result
 
@@ -2270,7 +2641,9 @@ class Pipeline(Runnable[None, PipelineResult]):
                 continue
             if t.cancelled():
                 ps_cancelled = task_ps[t]
-                step = self._build_step(ps_cancelled, ps_cancelled.external_inputs)
+                step = self._build_step(
+                    ps_cancelled, ps_cancelled.external_inputs, step_id=task_step[t].step_id
+                )
                 step.status = StepStatus.FAILED
                 step.error = "Step cancelled due to fail-fast after prior step failure"
                 results[idx] = step
@@ -2279,7 +2652,9 @@ class Pipeline(Runnable[None, PipelineResult]):
                     results[idx] = t.result()
                 except Exception as exc:
                     logger.debug("Task %d failed", idx)
-                    results[idx] = self._make_failed_step(task_ps[t], exc)
+                    results[idx] = self._make_failed_step(
+                        task_ps[t], exc, step_id=task_step[t].step_id
+                    )
 
         # Return in original order
         return [results[i] for i in sorted(results)]
@@ -2307,9 +2682,13 @@ class Pipeline(Runnable[None, PipelineResult]):
     ) -> list[_PipelineStep]:
         """Build a per-item step list by merging ``item`` into step 0.
 
-        Convention: ``item["prompt"]`` overrides step 0's prompt; every other
-        key merges into step 0's ``params`` (per-item values win). Steps after
-        index 0 are unchanged.
+        Convention: ``item["prompt"]`` overrides step 0's prompt;
+        ``item["metadata"]`` merges into step 0's ``Step.metadata`` and
+        ``item["prompt_visibility"]`` overrides step 0's prompt-redaction
+        level (both routed to their dedicated ``Step`` fields, not
+        ``params={}`` — same reserved-name contract as ``step()``, see
+        #53). Every remaining key merges into step 0's ``params`` (per-item
+        values win). Steps after index 0 are unchanged.
 
         Multi-step per-item params are intentionally out-of-scope here — the
         single-step batch case covers ~95% of asset-pack / aspect-ratio /
@@ -2321,9 +2700,42 @@ class Pipeline(Runnable[None, PipelineResult]):
             return steps
         head = steps[0]
         item_copy = dict(item)
+        for reserved in _RESERVED_INPUT_PARAM_NAMES:
+            if reserved in item_copy:
+                raise GenblazeError(
+                    f"'{reserved}' is not a valid batch_run(items=...) key — did you "
+                    f"mean 'external_inputs=' on step()? See docs/features/pipeline.md "
+                    f"for the three input mechanisms."
+                )
         new_prompt = item_copy.pop("prompt", head.prompt)
+        item_metadata = item_copy.pop("metadata", None)
+        item_visibility = item_copy.pop("prompt_visibility", None)
+        if item_metadata:
+            # Same collision guard as step() (#53) — without it, a batch item
+            # could forge _fallback_models/_input_from values directly into
+            # Step.metadata even on a step with no configured fallback_models/
+            # input_from, corrupting the internal replay-data invariant those
+            # keys exist to protect.
+            collision = _RESERVED_GRAPH_METADATA_KEYS & item_metadata.keys()
+            if collision:
+                raise GenblazeError(
+                    f"batch_run(items=...) metadata key(s) {sorted(collision)} are "
+                    "reserved for internal pipeline bookkeeping (fallback/"
+                    "input-routing replay data). Rename your metadata key(s)."
+                )
         merged_params = {**head.params, **item_copy}
-        new_head = replace(head, prompt=new_prompt, params=merged_params)
+        merged_metadata = (
+            {**(head.metadata or {}), **item_metadata} if item_metadata else head.metadata
+        )
+        new_head = replace(
+            head,
+            prompt=new_prompt,
+            params=merged_params,
+            metadata=merged_metadata,
+            prompt_visibility=item_visibility
+            if item_visibility is not None
+            else head.prompt_visibility,
+        )
         return [new_head, *steps[1:]]
 
     @staticmethod
@@ -2345,7 +2757,7 @@ class Pipeline(Runnable[None, PipelineResult]):
         prompts: list[str] | list[dict[str, str]] | None = None,
         *,
         items: list[dict[str, Any]] | None = None,
-        max_concurrency: int = 5,
+        max_concurrency: int | None = None,
         sink: BaseSink | None = None,
         fail_fast: bool = True,
         raise_on_failure: bool | None = None,
@@ -2354,11 +2766,12 @@ class Pipeline(Runnable[None, PipelineResult]):
         on_progress: Any = None,
         pipeline_timeout: float | None = None,
         on_step_complete: Any = None,
+        **unsupported: Any,
     ) -> list[PipelineResult]:
         """Execute the pipeline independently for each batch entry (sync).
 
-        Each entry produces its own run with cloned steps. Results are
-        returned in input order.
+        Each entry produces its own run with cloned steps, executed
+        SEQUENTIALLY. Results are returned in input order.
 
         Args:
             prompts: Per-item prompt overrides. Strings override step 0's
@@ -2368,7 +2781,13 @@ class Pipeline(Runnable[None, PipelineResult]):
                 fan-outs where each iteration needs different ``seed``,
                 ``aspect_ratio``, ``quality``, etc. Mutually exclusive with
                 ``prompts=``.
-            max_concurrency: Max concurrent pipeline executions (``abatch_run``).
+            max_concurrency: Validated (``>= 1``, else ``GenblazeError``) but
+                otherwise inert — sync ``batch_run()`` always executes items
+                sequentially; provider/sink instances are shared across
+                clones and not guaranteed thread-safe under real concurrent
+                execution (issue #83). Passing an explicit value emits one
+                ``UserWarning`` pointing at :meth:`abatch_run` for genuine
+                concurrency; omitting it (``None``, the default) is silent.
             sink: Optional sink to write each run to. Shared across all items
                 and closed once after the whole batch (not per item), unless the
                 sink opts out via ``_close_with_run = False``.
@@ -2379,10 +2798,20 @@ class Pipeline(Runnable[None, PipelineResult]):
             on_progress: Optional callback fired during provider poll loops.
             pipeline_timeout: End-to-end timeout in seconds for each pipeline.
             on_step_complete: Optional callback fired after each step completes.
+
+        Raises:
+            TypeError: If an unknown keyword argument is passed — see
+                :meth:`run`.
         """
         import copy
 
+        self._reject_unsupported_run_kwargs("batch_run", unsupported)
         self._validate_batch_args(prompts, items)
+        # Validates >= 1 and warns once if the caller explicitly asked for
+        # concurrency this sequential sync path can't provide (#83). The
+        # resolved value has no effect on execution — sync batch_run() has
+        # always run items sequentially, by design (see the helper's docstring).
+        _resolve_batch_max_concurrency(max_concurrency)
         # Resolve the deprecation sentinel ONCE per batch — otherwise each
         # per-item ``pipe.run()`` would re-trigger the warning, swamping logs
         # for callers iterating over hundreds of items. The warning text
@@ -2455,15 +2884,26 @@ class Pipeline(Runnable[None, PipelineResult]):
         on_progress: Any = None,
         pipeline_timeout: float | None = None,
         on_step_complete: Any = None,
+        **unsupported: Any,
     ) -> list[PipelineResult]:
         """Execute the pipeline independently for each batch entry (async).
 
         Uses a semaphore to limit concurrency. Either ``prompts=`` or ``items=``
         must be supplied; see :meth:`batch_run` for the semantic difference.
+
+        Raises:
+            TypeError: If an unknown keyword argument is passed — see
+                :meth:`run`.
+            GenblazeError: If ``max_concurrency < 1`` — a non-positive value
+                would otherwise build a ``asyncio.Semaphore`` no task can ever
+                acquire, hanging forever instead of failing fast (issue #83).
         """
         import copy
 
+        self._reject_unsupported_run_kwargs("abatch_run", unsupported)
         self._validate_batch_args(prompts, items)
+        if max_concurrency < 1:
+            raise GenblazeError(f"max_concurrency must be >= 1, got {max_concurrency}")
         # Resolve the deprecation sentinel ONCE per batch — see batch_run.
         # Same collect-then-raise semantics: each per-item run is silenced,
         # ``BatchPipelineError`` is synthesized after gather completes.

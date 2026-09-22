@@ -13,6 +13,7 @@ from genblaze_core.providers.family import (
     LiveProbeResult,
     ModelFamily,
 )
+from genblaze_core.providers.pattern_safety import has_re2
 from genblaze_core.providers.pricing import per_unit
 from genblaze_core.providers.spec import ModelSpec
 
@@ -63,11 +64,34 @@ class TestConstruction:
                 description="invalid",
             )
 
+    # `(a+)+` is rejected by the static heuristic (nested unbounded
+    # quantifier). This used to skip when `re2` was active, on the mistaken
+    # assumption that `re2` accepting the pattern for its own linear-time
+    # engine made it safe overall — but `ModelFamily.matches()` always
+    # matches with stdlib `re`, which still backtracks catastrophically on
+    # this shape regardless of `re2`. That gap was itself issue #148; the
+    # heuristic now always runs, so construction must fail closed under
+    # either strategy. `test_pattern_safety.py` covers each branch in depth.
     def test_unsafe_pattern_rejected_at_construction(self) -> None:
         with pytest.raises(ValueError, match="catastrophic backtracking"):
             ModelFamily(
                 name="evil",
                 pattern=re.compile(r"(a+)+"),
+                spec_template=_spec(),
+                description="invalid",
+            )
+
+    @pytest.mark.skipif(
+        not has_re2(), reason="exercises the additional re2-gate construction path"
+    )
+    def test_re2_incompatible_pattern_rejected_at_construction(self) -> None:
+        # Backreferences aren't supported by RE2's linear-time engine, so
+        # this is unsafe-under-re2 the same way `(a+)+` is unsafe-under-the-
+        # heuristic — construction must still fail closed.
+        with pytest.raises(ValueError, match="rejected by google-re2"):
+            ModelFamily(
+                name="evil",
+                pattern=re.compile(r"(a)\1"),
                 spec_template=_spec(),
                 description="invalid",
             )

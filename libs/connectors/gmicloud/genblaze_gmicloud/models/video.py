@@ -1,6 +1,6 @@
 """GMICloud video-model families.
 
-Three families, ordered most-specific-first:
+Families, ordered most-specific-first:
 
 1. ``gmi-video-pixverse`` — Pixverse v5.6 t2v / i2v / transition. Adds
    ``quality`` to the allowlist (required by the upstream API but
@@ -12,6 +12,13 @@ Three families, ordered most-specific-first:
    = True`` so ``fetch_output`` knows to attach audio metadata to the
    asset alongside the video track. Carries ``veo3-fast`` as a known
    unstable example.
+4. ``gmi-video-kling-v21`` — Kling V2.1 (Text2Video / Image2Video),
+   PascalCase wire form via ``canonical_slug``.
+5. ``gmi-video-seedance`` — Seedance first/last-frame (FLF2V) and
+   single-image I2V. Adds ``first_frame`` / ``last_frame`` — GMI's
+   documented native slot names — so both frames of an FLF2V pair reach
+   the wire instead of silently degrading to the fallback's single
+   ``image`` slot (#175).
 
 Slugs that don't match any family fall through to the permissive
 fallback. Registry-level ``unstable_slugs`` carries the remaining
@@ -31,25 +38,79 @@ runtime; preflight surfaces ``OK_PROVISIONAL`` with
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Mapping
+from typing import Any, TypedDict
 
 from genblaze_core.models.enums import Modality
 from genblaze_core.providers import (
+    IntSchema,
     ModelFamily,
     ModelRegistry,
     ModelSpec,
+    ParamSchema,
     ParamSurface,
     route_images,
 )
 
 from .._probe import empty_payload_request_probe
 
+# GMICloud does not expose a stable public per-family duration matrix. Keep a
+# finite connector-wide cap so untrusted callers cannot enqueue unbounded,
+# per-second video work through the permissive fallback.
+_MAX_VIDEO_DURATION_SECONDS = 60
+_DURATION_SECONDS_SCHEMA = IntSchema(min=1, max=_MAX_VIDEO_DURATION_SECONDS)
+
+
+class _DurationParamContract(TypedDict):
+    param_coercers: Mapping[str, Callable[[Any], Any]]
+    param_schemas: Mapping[str, ParamSchema]
+
+
+def _coerce_whole_seconds(value: Any) -> Any:
+    """Coerce only whole-second duration values.
+
+    Invalid values intentionally pass through so ``IntSchema`` emits the
+    standard typed validation error instead of leaking a raw ``int()`` failure
+    or silently truncating fractional seconds.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"[+-]?\d+", stripped):
+            return int(stripped)
+    return value
+
+
+_DURATION_PARAM_CONTRACT: _DurationParamContract = {
+    "param_coercers": {"duration": _coerce_whole_seconds},
+    "param_schemas": {"duration": _DURATION_SECONDS_SCHEMA},
+}
+
+
+def _video_surface_fields(surface: ParamSurface) -> dict[str, Any]:
+    fields = surface.build()
+    fields["param_coercers"] = {
+        **fields.get("param_coercers", {}),
+        **_DURATION_PARAM_CONTRACT["param_coercers"],
+    }
+    fields["param_schemas"] = {
+        **fields.get("param_schemas", {}),
+        **_DURATION_PARAM_CONTRACT["param_schemas"],
+    }
+    return fields
+
+
 # Default video surface — universally meaningful video params + GMI's
 # canonical-to-native ``guidance_scale``→``cfg_scale`` rename and
-# duration coercion.
+# shared whole-second duration contract.
 _VIDEO_BASE = (
     ParamSurface.for_modality(Modality.VIDEO)
     .with_aliases(guidance_scale="cfg_scale")
-    .with_coercers(duration=int)
     .extend("cfg_scale")
 )
 
@@ -58,6 +119,10 @@ _PIXVERSE = _VIDEO_BASE.extend("quality")
 
 # Wan transition / r2v variants accept multiple keyframes via image_url.
 _WAN_REF = _VIDEO_BASE.extend("image_url", "tail_image_url")
+
+# Seedance first/last-frame (FLF2V) and single-image I2V both take GMI's
+# documented ``first_frame`` / ``last_frame`` native slots.
+_SEEDANCE = _VIDEO_BASE.extend("first_frame", "last_frame")
 
 
 _COMMON_INPUT = route_images(slots=("image",))
@@ -72,7 +137,7 @@ _GMI_VIDEO_PIXVERSE_FAMILY = ModelFamily(
         modality=Modality.VIDEO,
         input_mapping=_COMMON_INPUT,
         extras=_ENVELOPE,
-        **_PIXVERSE.build(),
+        **_video_surface_fields(_PIXVERSE),
     ),
     description="Pixverse v5.6 family — t2v, i2v, transition.",
     example_slugs=(
@@ -94,7 +159,7 @@ _GMI_VIDEO_WAN_R2V_FAMILY = ModelFamily(
         modality=Modality.VIDEO,
         input_mapping=_COMMON_INPUT,
         extras=_ENVELOPE,
-        **_WAN_REF.build(),
+        **_video_surface_fields(_WAN_REF),
     ),
     description="Wan reference-to-video — keyframe-conditioned generation.",
     example_slugs=("wan2.6-r2v",),
@@ -136,7 +201,7 @@ _GMI_VIDEO_VEO_FAMILY = ModelFamily(
         # "this model produces audio" signal alongside the family
         # definition where future maintainers will look for it.
         extras={**_ENVELOPE, "has_audio": True},
-        **_VIDEO_BASE.build(),
+        **_video_surface_fields(_VIDEO_BASE),
     ),
     description="Google Veo family on GMI — produces video + audio tracks.",
     example_slugs=("Veo3", "Veo3-Fast"),
@@ -179,7 +244,7 @@ _GMI_VIDEO_KLING_V21_FAMILY = ModelFamily(
         modality=Modality.VIDEO,
         input_mapping=_COMMON_INPUT,
         extras=_ENVELOPE,
-        **_VIDEO_BASE.build(),
+        **_video_surface_fields(_VIDEO_BASE),
     ),
     description="Kling V2.1 (Master) — Text2Video / Image2Video on GMI.",
     example_slugs=("Kling-Text2Video-V2.1-Master", "Kling-Image2Video-V2.1-Master"),
@@ -188,11 +253,34 @@ _GMI_VIDEO_KLING_V21_FAMILY = ModelFamily(
 )
 
 
+# Seedance FLF2V (first/last-frame) and single-image I2V — GMI documents
+# ``first_frame``/``last_frame`` as the native slot names. Without this
+# family, seedance slugs fell through to the permissive fallback's
+# ``route_images(slots=("image",))`` mapping, which both mis-named the
+# first frame and silently dropped the second (#175 — no warning, no
+# error, just a smaller-than-requested payload on the wire).
+_GMI_VIDEO_SEEDANCE_FAMILY = ModelFamily(
+    name="gmi-video-seedance",
+    pattern=re.compile(r"^seedance-"),
+    spec_template=ModelSpec(
+        model_id="*",
+        modality=Modality.VIDEO,
+        input_mapping=route_images(slots=("first_frame", "last_frame")),
+        extras=_ENVELOPE,
+        **_video_surface_fields(_SEEDANCE),
+    ),
+    description="Seedance first/last-frame (FLF2V) and single-image I2V.",
+    example_slugs=("seedance-2-0-260128", "seedance-1-0-pro-fast-251015"),
+    probe=empty_payload_request_probe,
+)
+
+
 _FALLBACK = ModelSpec(
     model_id="*",
     modality=Modality.VIDEO,
     param_aliases={"guidance_scale": "cfg_scale"},
-    param_coercers={"duration": int},
+    param_coercers=_DURATION_PARAM_CONTRACT["param_coercers"],
+    param_schemas=_DURATION_PARAM_CONTRACT["param_schemas"],
     input_mapping=_COMMON_INPUT,
     extras=_ENVELOPE,
 )
@@ -224,7 +312,12 @@ def build_video_registry() -> ModelRegistry:
             _GMI_VIDEO_WAN_R2V_FAMILY,
             _GMI_VIDEO_VEO_FAMILY,
             _GMI_VIDEO_KLING_V21_FAMILY,
+            _GMI_VIDEO_SEEDANCE_FAMILY,
         ),
         fallback=_FALLBACK,
         unstable_slugs=_UNSTABLE_SLUGS,
+        # See ``build_image_registry()`` for why unmatched slugs need a
+        # liveness probe (#248): without one, a real GMI video slug and a
+        # fabricated one both grade UNKNOWN_PERMISSIVE.
+        fallback_probe=empty_payload_request_probe,
     )

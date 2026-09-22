@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
@@ -100,6 +101,91 @@ def test_poll_returns_true_on_failed(provider):
     assert provider.poll("req-abc123") is True
 
 
+# --- Poll stall ceiling (issue #262) ---
+
+
+def _processing_provider(max_poll_seconds):
+    """Provider whose poll endpoint is wedged in 'processing' forever."""
+    from genblaze_gmicloud import GMICloudVideoProvider
+
+    p = GMICloudVideoProvider(api_key="test-api-key-123", max_poll_seconds=max_poll_seconds)
+    client = make_mock_http_client(outcome_url="https://gmicloud-output.com/video.mp4")
+    processing = MagicMock()
+    processing.status_code = 200
+    processing.json.return_value = {"request_id": "req-abc123", "status": "processing"}
+    client.get.return_value = processing
+    p._http_client = client
+    return p
+
+
+def test_poll_raises_timeout_when_stalled_past_ceiling():
+    p = _processing_provider(max_poll_seconds=1.0)
+    # Pretend this request has been polling far longer than the ceiling.
+    p._poll_first_seen["req-abc123"] = time.monotonic() - 100.0
+    with pytest.raises(ProviderError) as exc_info:
+        p.poll("req-abc123")
+    assert exc_info.value.error_code == ProviderErrorCode.TIMEOUT
+    msg = str(exc_info.value)
+    assert "req-abc123" in msg
+    assert "processing" in msg
+
+
+def test_poll_does_not_raise_before_ceiling():
+    p = _processing_provider(max_poll_seconds=1800.0)
+    # First poll seeds the deadline; well within the window → not done, no raise.
+    assert p.poll("req-abc123") is False
+    assert p.poll("req-abc123") is False
+
+
+def test_poll_ceiling_disabled_when_none():
+    p = _processing_provider(max_poll_seconds=None)
+    p._poll_first_seen["req-abc123"] = time.monotonic() - 100_000.0
+    # No ceiling → never raises, just keeps reporting "not done".
+    assert p.poll("req-abc123") is False
+
+
+def test_poll_terminal_clears_first_seen(provider):
+    # The provider fixture's mock GET returns status "success".
+    assert provider.poll("req-abc123") is True
+    assert "req-abc123" not in provider._poll_first_seen
+
+
+def test_poll_ceiling_is_per_prediction_id():
+    p = _processing_provider(max_poll_seconds=1.0)
+    p._poll_first_seen["req-old"] = time.monotonic() - 100.0
+    # A fresh id is tracked independently and stays within its own window.
+    assert p.poll("req-fresh") is False
+    assert "req-fresh" in p._poll_first_seen
+    with pytest.raises(ProviderError):
+        p.poll("req-old")
+
+
+def test_stalled_job_terminates_as_failed_step(monkeypatch):
+    # A wedged job with a large caller timeout must still terminate — the
+    # connector ceiling, not the caller's timeout, is what ends it (#262).
+    monkeypatch.setattr("genblaze_core.providers.base.time.sleep", lambda *a, **k: None)
+    p = _processing_provider(max_poll_seconds=1.0)
+    p.poll_interval = 0.0
+
+    # Suppress the estimated_seconds initial delay (same idiom as the
+    # compliance harness at the bottom of this file).
+    original_submit = p.submit
+
+    def fast_submit(step, config=None):
+        r = original_submit(step, config)
+        r.estimated_seconds = None
+        return r
+
+    p.submit = fast_submit
+    # Pre-age the request so the ceiling trips on the first poll.
+    p._poll_first_seen["req-abc123"] = time.monotonic() - 100.0
+
+    step = Step(provider="gmicloud", model="seedance-2-0-260128", prompt="a 60s sunset")
+    result = p.invoke(step, {"timeout": 3600.0})
+    assert result.status == StepStatus.FAILED
+    assert result.error_code == ProviderErrorCode.TIMEOUT
+
+
 # --- Fetch output ---
 
 
@@ -132,6 +218,18 @@ def test_fetch_output_cancelled_raises(provider):
     provider.poll("req-abc123")
     step = Step(provider="gmicloud", model="kling-text2video-v1.6-pro", prompt="test")
     with pytest.raises(ProviderError, match="cancelled"):
+        provider.fetch_output("req-abc123", step)
+
+
+def test_fetch_output_raises_on_unexpected_status(provider):
+    # A non-success status reaching fetch must produce a clear terminal error
+    # naming the status — not a vague "no video URL found".
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"status": "processing", "outcome": {}}
+    provider._http_client.get.return_value = resp
+    step = Step(provider="gmicloud", model="kling-text2video-v1.6-pro", prompt="test")
+    with pytest.raises(ProviderError, match="processing"):
         provider.fetch_output("req-abc123", step)
 
 
@@ -409,6 +507,58 @@ def test_duration_coerced_to_int(provider):
     assert provider.prepare_payload(step)["duration"] == 10
 
 
+def _assert_invalid_duration(provider, model: str, duration):
+    step = Step(
+        provider="gmicloud",
+        model=model,
+        prompt="t",
+        params={"duration": duration},
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        provider.prepare_payload(step)
+
+    msg = str(exc_info.value)
+    assert exc_info.value.error_code == ProviderErrorCode.INVALID_INPUT
+    assert "duration" in msg
+    assert "Failed to coerce" not in msg
+    assert "invalid literal for int()" not in msg
+
+
+@pytest.mark.parametrize("duration", [5.5, 8.9])
+@pytest.mark.parametrize("model", ["kling-text2video-v1.6-pro", "pixverse-v5.6-t2v"])
+def test_fractional_duration_rejected_without_truncation(provider, duration, model):
+    _assert_invalid_duration(provider, model, duration)
+
+
+@pytest.mark.parametrize("model", ["kling-text2video-v1.6-pro", "pixverse-v5.6-t2v"])
+def test_fractional_duration_string_rejected_with_typed_error(provider, model):
+    _assert_invalid_duration(provider, model, "7.5")
+
+
+@pytest.mark.parametrize("duration", [0, -1, 61, 10**9])
+@pytest.mark.parametrize("model", ["kling-text2video-v1.6-pro", "pixverse-v5.6-t2v"])
+def test_out_of_range_duration_rejected(provider, duration, model):
+    _assert_invalid_duration(provider, model, duration)
+
+
+@pytest.mark.parametrize("duration", [0, -1, 61, 10**9])
+@pytest.mark.parametrize("model", ["kling-text2video-v1.6-pro", "pixverse-v5.6-t2v"])
+def test_invalid_duration_does_not_submit_http_request(provider, duration, model):
+    step = Step(
+        provider="gmicloud",
+        model=model,
+        prompt="t",
+        params={"duration": duration},
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        provider.submit(step)
+
+    assert exc_info.value.error_code == ProviderErrorCode.INVALID_INPUT
+    provider._http_client.post.assert_not_called()
+
+
 def test_guidance_scale_aliased_to_cfg_scale(provider):
     step = Step(
         provider="gmicloud",
@@ -432,6 +582,65 @@ def test_prepare_payload_is_idempotent_for_normalized_params(provider):
     # Re-running against already-normalized params produces the same dict.
     step2 = Step(provider="gmicloud", model=step.model, prompt="t", params=once)
     assert provider.prepare_payload(step2) == once
+
+
+# --- Seedance FLF2V / I2V (#175) ---
+
+
+def test_seedance_flf2v_maps_both_frames(provider):
+    """Both frames of a Seedance first/last-frame step must reach the wire
+    under GMI's documented ``first_frame``/``last_frame`` names — the
+    permissive fallback silently dropped the second frame (#175)."""
+    from genblaze_core.models.asset import Asset
+
+    step = Step(
+        provider="gmicloud",
+        model="seedance-2-0-260128",
+        prompt="bridge",
+        inputs=[
+            Asset(url="https://example.com/first.png", media_type="image/png"),
+            Asset(url="https://example.com/last.png", media_type="image/png"),
+        ],
+    )
+    result = provider.prepare_payload(step)
+    assert result == {
+        "prompt": "bridge",
+        "first_frame": "https://example.com/first.png",
+        "last_frame": "https://example.com/last.png",
+    }
+
+
+def test_seedance_single_image_maps_to_first_frame(provider):
+    """A single-image Seedance call (I2V, no last frame) still maps to
+    ``first_frame`` — GMI's documented I2V parameter for Seedance."""
+    from genblaze_core.models.asset import Asset
+
+    step = Step(
+        provider="gmicloud",
+        model="seedance-1-0-pro-fast-251015",
+        prompt="animate this",
+        inputs=[Asset(url="https://example.com/first.png", media_type="image/png")],
+    )
+    result = provider.prepare_payload(step)
+    assert result == {
+        "prompt": "animate this",
+        "first_frame": "https://example.com/first.png",
+    }
+
+
+def test_unknown_video_model_still_hits_fallback(provider):
+    """A genuinely-unknown video slug still routes through the permissive
+    fallback's single ``image`` slot — only Seedance was pulled out of it."""
+    from genblaze_core.models.asset import Asset
+
+    step = Step(
+        provider="gmicloud",
+        model="totally-unknown-video-slug-v9",
+        prompt="t",
+        inputs=[Asset(url="https://example.com/first.png", media_type="image/png")],
+    )
+    result = provider.prepare_payload(step)
+    assert result["image"] == "https://example.com/first.png"
 
 
 # --- Passthrough ---

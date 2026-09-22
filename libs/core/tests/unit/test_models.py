@@ -57,12 +57,136 @@ def test_asset_tolerates_malformed_sha256_assignment():
     assert asset.sha256 == "not-a-sha"
 
 
+# --- Issue #78: reject impossible numeric/media-type metadata on construction ---
+# NOTE: sha256 is intentionally excluded (see test_asset_tolerates_malformed_sha256_*
+# above and the comment on Asset in asset.py) — that field stays tolerant at
+# construction by design; verify() is the enforcement boundary.
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"size_bytes": -1},
+        {"width": -640},
+        {"width": 0},
+        {"height": 0},
+        {"height": -480},
+        {"duration": -3.5},
+        {"duration": float("nan")},
+        {"duration": float("inf")},
+    ],
+)
+def test_asset_rejects_impossible_numeric_fields(kwargs):
+    with pytest.raises(ValidationError):
+        Asset(url="https://example.com/a.png", media_type="image/png", **kwargs)
+
+
+def test_asset_accepts_valid_numeric_fields():
+    asset = Asset(
+        url="https://example.com/a.png",
+        media_type="image/png",
+        size_bytes=1024,
+        width=640,
+        height=480,
+        duration=3.5,
+    )
+    assert asset.size_bytes == 1024
+    assert asset.width == 640
+    assert asset.height == 480
+    assert asset.duration == 3.5
+
+
+@pytest.mark.parametrize("media_type", ["not-a-mime", "image", "/png", "image/", ""])
+def test_asset_rejects_malformed_media_type(media_type):
+    with pytest.raises(ValidationError, match="media_type"):
+        Asset(url="https://example.com/a.png", media_type=media_type)
+
+
+def test_asset_set_hash_still_works_without_caller_changes():
+    """Asset.set_hash() must keep working — it always produces valid sha256/size_bytes."""
+    asset = Asset(url="https://example.com/a.png", media_type="image/png")
+    asset.set_hash(b"some bytes")
+    assert asset.sha256 is not None
+    from genblaze_core.models.asset import is_valid_sha256
+
+    assert is_valid_sha256(asset.sha256)
+    assert asset.size_bytes == len(b"some bytes")
+
+
+def test_word_timing_rejects_end_before_start():
+    with pytest.raises(ValidationError, match="end"):
+        WordTiming(word="hi", start=2.0, end=1.0)
+
+
+def test_word_timing_rejects_negative_start():
+    with pytest.raises(ValidationError):
+        WordTiming(word="hi", start=-1.0, end=1.0)
+
+
+def test_word_timing_rejects_out_of_range_confidence():
+    with pytest.raises(ValidationError):
+        WordTiming(word="hi", start=0.0, end=1.0, confidence=1.5)
+
+
+def test_word_timing_accepts_valid_bounds():
+    wt = WordTiming(word="hi", start=0.0, end=1.0, confidence=0.9)
+    assert wt.start == 0.0
+    assert wt.end == 1.0
+
+
+def test_video_metadata_rejects_impossible_values():
+    from genblaze_core.models.asset import VideoMetadata
+
+    with pytest.raises(ValidationError):
+        VideoMetadata(frame_rate=-30.0)
+    with pytest.raises(ValidationError):
+        VideoMetadata(bitrate=0)
+
+
+def test_audio_metadata_rejects_impossible_values():
+    from genblaze_core.models.asset import AudioMetadata
+
+    with pytest.raises(ValidationError):
+        AudioMetadata(sample_rate=0)
+    with pytest.raises(ValidationError):
+        AudioMetadata(channels=-1)
+    with pytest.raises(ValidationError):
+        AudioMetadata(bitrate=-128000)
+
+
+def test_asset_with_impossible_metadata_no_longer_reaches_manifest():
+    """Regression test for the issue #78 repro — construction now fails fast
+    instead of letting impossible metadata become canonical provenance data."""
+    with pytest.raises(ValidationError):
+        Asset(
+            url="https://example.com/a.png",
+            media_type="image/png",
+            size_bytes=-1,
+            width=-640,
+            height=0,
+            duration=-3.5,
+        )
+
+
 def test_step_defaults():
     s = Step(provider="replicate", model="flux-schnell")
     assert s.step_id
     assert s.status == StepStatus.PENDING
     assert s.modality == Modality.IMAGE
     assert s.assets == []
+
+
+def test_step_rejects_unknown_kwargs():
+    """Unrecognized constructor kwargs must raise, not vanish silently (issue #133).
+
+    Pydantic v2's default ``extra="ignore"`` behavior let callers pass
+    provider-specific keys (e.g. ``duration=10``) directly to ``Step(...)``
+    and have them disappear with no error and no warning — the same class of
+    silent data loss as the ``.step(params={...})`` nesting bug. Unknown keys
+    belong in ``params={...}``.
+    """
+    with pytest.raises(ValidationError, match="duration"):
+        Step(provider="replicate", model="flux-schnell", duration=10)
 
 
 def test_run_with_steps():
@@ -267,6 +391,43 @@ def test_parse_manifest_tolerates_malformed_sha256_but_verify_rejects():
 
     assert parsed.verify_hash()
     assert parsed.output_asset_ids_missing_sha256() == [asset.asset_id]
+    assert not parsed.verify()
+
+
+def test_parse_manifest_tolerates_impossible_asset_metadata_but_verify_rejects():
+    """#149: an older/foreign manifest with width=0 (a common "unknown
+    dimensions" placeholder) or a nonstandard media_type must still load via
+    parse_manifest() instead of raising ValidationError. verify() is the
+    enforcement boundary — mirroring the sha256 tolerance pattern.
+    """
+    # Build the "foreign" asset via the same tolerant path parse_manifest()
+    # uses (Asset(...) construction still rejects these values by design).
+    asset = Asset.model_validate(
+        {
+            "url": "https://cdn.example.com/output.png",
+            "media_type": "unknown",
+            "sha256": "a" * 64,
+            "width": 0,
+            "height": 0,
+        },
+        context={"tolerant_load": True},
+    )
+    step = Step(
+        provider="mock",
+        model="m",
+        prompt="same prompt",
+        status=StepStatus.SUCCEEDED,
+        assets=[asset],
+    )
+    manifest = Manifest(run=Run(name="same", steps=[step]))
+    manifest.compute_hash()
+
+    parsed = parse_manifest(manifest.model_dump(mode="python"))
+
+    assert parsed.run.steps[0].assets[0].width == 0
+    assert parsed.run.steps[0].assets[0].media_type == "unknown"
+    assert parsed.verify_hash()
+    assert parsed.output_asset_ids_with_invalid_metadata() == [asset.asset_id]
     assert not parsed.verify()
 
 
@@ -734,6 +895,24 @@ def test_equivalent_reruns_produce_same_hash():
     assert s1.step_id != s2.step_id
     # But hashes are identical because IDs are excluded
     assert m1.canonical_hash == m2.canonical_hash
+
+
+def test_asset_provenance_key_ignores_asset_id_and_url():
+    """Regression for issue #76: the content-based sort key used by
+    Pipeline.ingest must tie for assets that differ only in asset_id/url —
+    the same fields _hash_payload excludes — and differ when actual
+    hash-relevant content (sha256) differs."""
+    from genblaze_core.models.manifest import asset_provenance_key
+
+    a1 = Asset(url="https://x/a.mp3", media_type="audio/mp3", sha256="a" * 64, size_bytes=1)
+    a2 = Asset(
+        url="https://x/different.mp3", media_type="audio/mp3", sha256="a" * 64, size_bytes=1
+    )
+    assert a1.asset_id != a2.asset_id
+    assert asset_provenance_key(a1) == asset_provenance_key(a2)
+
+    b = Asset(url="https://x/b.mp3", media_type="audio/mp3", sha256="b" * 64, size_bytes=1)
+    assert asset_provenance_key(a1) != asset_provenance_key(b)
 
 
 def test_old_v1_3_manifest_still_verifies():

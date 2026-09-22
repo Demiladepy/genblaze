@@ -33,6 +33,39 @@ def compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def local_file_url(path: Path) -> str:
+    """Build a ``file://`` URL for an absolute local path.
+
+    Uses ``Path.as_uri()`` (RFC 8089), which yields the empty-netloc form —
+    ``file:///C:/Users/...`` on Windows, ``file:///tmp/...`` on POSIX — that
+    the rest of the pipeline already expects: ``_read_local_file``,
+    ``validate_chain_input_url``, and the assemblyai connector all parse
+    ``file://`` URLs via ``url2pathname``, which handles this form correctly
+    on every platform.
+
+    The previous per-connector pattern, ``f"file://{quote(str(path))}"``,
+    percent-encoded Windows drive colons and backslashes
+    (``C:\\Users\\...`` -> ``C%3A%5CUsers%5C...``). ``urlparse`` then read
+    the entire percent-encoded string as ``netloc`` with an empty ``path``,
+    so every connector-produced asset silently failed to upload on Windows
+    (#164). Single chokepoint for all connectors + core ffmpeg providers
+    that write a local output and expose it as a ``file://`` asset.
+
+    Windows UNC paths (``\\\\server\\share\\...``) are not supported:
+    ``as_uri()`` renders them with the server in the ``netloc``, which the
+    empty-netloc-only parsers reject. Call sites write to ``tempfile``
+    output on a local drive, so this does not arise in practice.
+
+    Args:
+        path: An absolute filesystem path — callers should ``.resolve()``
+            first.
+
+    Raises:
+        ValueError: If ``path`` is not absolute (raised by ``as_uri()``).
+    """
+    return path.as_uri()
+
+
 def normalize_tenant_id(tenant_id: str | None) -> str | None:
     """Normalize a tenant identifier: strip surrounding whitespace, "" -> None.
 
@@ -78,9 +111,55 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("169.254.0.0/16"),  # Link-local / IMDS
     ipaddress.ip_network("100.64.0.0/10"),  # Carrier-grade NAT
     ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("::/128"),  # IPv6 unspecified address
     ipaddress.ip_network("fc00::/7"),  # IPv6 unique local
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
 ]
+
+# RFC 6052 "Well-Known Prefix" for NAT64 — the embedded IPv4 address occupies
+# the low 32 bits. Distinct from IPv4-mapped IPv6 (::ffff:0:0/96, unwrapped
+# via ip.ipv4_mapped below): a NAT64-translating resolver can hand back this
+# form for a name that maps to a private/IMDS IPv4 target, and neither
+# BLOCKED_NETWORKS nor ``ipv4_mapped`` recognizes it without explicit
+# extraction.
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _normalize_ip(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Unwrap IPv4-mapped IPv6 and NAT64 well-known-prefix addresses to their
+    embedded IPv4 form. Returns ``ip`` unchanged for anything else (plain
+    IPv4, or IPv6 that isn't one of these two embedding schemes) so the
+    blocklist/backstop check below always sees the "real" target address.
+    """
+    if ip.version != 6:
+        return ip
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return mapped
+    if ip in _NAT64_WELL_KNOWN_PREFIX:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True if ``ip`` (already passed through :func:`_normalize_ip`) is a
+    private/loopback/link-local/reserved/unspecified address.
+
+    Combines the explicit ``BLOCKED_NETWORKS`` denylist (covers the specific
+    cloud-metadata address and ranges the stdlib properties below don't
+    flag) with a property-based backstop, so a gap in either approach is
+    covered by the other rather than compounding.
+    """
+    return (
+        any(ip in net for net in BLOCKED_NETWORKS)
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
 
 
 # Allowed parent directories for file:// inputs (shared by storage + ffmpeg providers)
@@ -131,12 +210,11 @@ def resolve_ssrf(url: str, *, exc_type: type[Exception] = ValueError) -> tuple[s
         except ValueError:
             continue
         # Normalize IPv4-mapped IPv6 (::ffff:169.254.x.x, ::ffff:10.x.x.x, etc.)
-        # so the IPv4 BLOCKED_NETWORKS entries match. Without this, an attacker
-        # who controls DNS can return an IPv4-mapped address that bypasses the
-        # IPv4 blocklist entries while the OS connects to the private IPv4 target.
-        if ip.version == 6 and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
-        if any(ip in net for net in BLOCKED_NETWORKS):
+        # and NAT64 (64:ff9b::/96) so the IPv4 BLOCKED_NETWORKS entries match.
+        # Without this, an attacker who controls DNS can return one of these
+        # forms and bypass the IPv4 blocklist while the OS connects to the
+        # embedded private/IMDS IPv4 target.
+        if _is_blocked_ip(_normalize_ip(ip)):
             raise exc_type(f"Private/loopback URLs are not allowed: {host}")
         if pinned_ip is None:
             pinned_ip = raw_ip  # pin to the first validated address

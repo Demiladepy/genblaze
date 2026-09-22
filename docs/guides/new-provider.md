@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-05-07 -->
+<!-- last_verified: 2026-07-27 -->
 # Adding a New Provider
 
 Step-by-step guide for contributing a provider adapter to genblaze. This guide is the canonical contract — every section maps to a check the compliance harness or pipeline relies on.
@@ -66,12 +66,15 @@ requires-python = ">=3.11"
 license = "MIT"
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
     "Typing :: Typed",
 ]
 dependencies = [
     "genblaze-core>=0.3.0,<0.4",
-    "myprovider-sdk>=1.0",
+    # Cap every third-party runtime dep below its next major (`<1` if the
+    # SDK is still pre-1.0 — one rule for both, no separate next-minor
+    # carve-out) so a vendor major bump can't silently break a fresh
+    # install — see RELEASING.md's Dependency pinning policy (#61).
+    "myprovider-sdk>=1.0,<2",
 ]
 
 [project.urls]
@@ -97,6 +100,8 @@ testpaths = ["tests"]
 ```
 
 The entry point under `genblaze.providers` is how `discover_providers()` and the CLI `replay` command find your provider at runtime. Ship a `py.typed` marker file inside the package so consumers get type-checker support.
+
+The package `README.md` is rendered directly on PyPI. Any cross-file links in that README must use absolute GitHub URLs, for example `https://github.com/backblaze-labs/genblaze/blob/main/docs/reference/pricing-recipes.md`; PyPI does not rewrite repository-relative links such as `../../../docs/...`. In-page anchors such as `#usage` and `mailto:` links are allowed.
 
 ## 3. Implement the provider
 
@@ -134,6 +139,11 @@ class MyProvider(SyncProvider):
         # registry or tune retry behavior without subclassing. Always call
         # super().__init__() — it sets up poll caching, retry policy,
         # preflight gates, and the registry.
+        #
+        # Never decorate a provider class with @dataclass: the generated
+        # __init__ replaces this one, so super().__init__() never runs and
+        # the instance is missing all of the state above. Construction fails
+        # loudly with a TypeError if this happens.
         super().__init__(models=models, retry_policy=retry_policy)
         self._api_key = api_key
         self._client: Any = None
@@ -259,6 +269,8 @@ if step.inputs:
 ```
 
 This prevents SSRF — only `https://` and `file://` URLs are allowed.
+
+> **Local file output:** if your provider writes a local file and exposes it as a `file://` asset, build the URL with `genblaze_core._utils.local_file_url(path.resolve())` — never `f"file://{quote(str(path))}"`. `local_file_url()` uses `Path.as_uri()`, which yields the empty-netloc form (`file:///C:/...`) that parses correctly on every platform, including Windows; the hand-rolled `quote()` pattern percent-encodes the drive colon and broke every connector-produced asset on Windows (#164).
 
 > **Shortcut:** if your provider uses a `ModelSpec` with `input_mapping` declared, call `self.prepare_payload(step, base_params=...)` instead. It runs the full ModelSpec pipeline (aliases → transformer → chain inputs → coercers → defaults → schemas → required → constraints → allowlist) **and** SSRF-validates every `step.inputs` URL automatically. See [`model-registry.md`](../features/model-registry.md) for the pipeline order.
 
@@ -521,7 +533,10 @@ def fetch_output(self, prediction_id, step):
     ...
 ```
 
-`super().__init__()` (from §3) initializes the cache — never skip it.
+`super().__init__()` (from §3) initializes the cache — never skip it. Do not
+decorate a provider subclass with `@dataclass`: it generates its own
+`__init__` that replaces the one you wrote, so `super().__init__()` never runs
+and construction fails with a `TypeError`.
 
 ## 13. Advanced: timing hints with SubmitResult (BaseProvider only)
 
@@ -683,6 +698,7 @@ pip install -e "libs/connectors/myprovider[dev]"
 **Provider class**
 - [ ] Subclass `SyncProvider` (preferred) or `BaseProvider` (polling APIs only)
 - [ ] `super().__init__(models=models)` called in constructor
+- [ ] Provider class is **not** decorated with `@dataclass` (its generated `__init__` would replace yours and skip `super().__init__()`)
 - [ ] `get_capabilities()` declares supported modalities, inputs, models, `accepts_chain_input`
 - [ ] `normalize_params()` maps standard names (`duration`, `resolution`, `aspect_ratio`, `voice_id`, `output_format`) and is idempotent
 - [ ] `create_registry()` returns a `ModelRegistry` with per-model `pricing` strategies (or documents why it doesn't)

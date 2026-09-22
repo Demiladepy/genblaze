@@ -36,16 +36,56 @@ Convention:
 The release workflow validates `tag == "v" + latest CHANGELOG wave name`
 before doing anything else. A mismatch fails the run.
 
+## Dependency pinning policy
+
+Two independent conventions apply to every `pyproject.toml`'s
+`[project.dependencies]` and product-facing `optional-dependencies` extras
+(dev/test tooling extras like `dev`/`testing` are exempt — see below):
+
+* **Internal `genblaze-*` deps** are pinned `>=<current>,<0.4` (bump the
+  upper bound only when the monorepo's own version line advances — see
+  `tools/check_pin_parity.py`).
+* **Third-party runtime deps** are capped below their next major version
+  (`>=X.Y,<X+1`), including packages still on a pre-1.0 line (`>=0.Y,<1`) —
+  e.g. `pydantic>=2.0,<3`, `lmnt>=2.6,<3`, `elevenlabs>=2.0,<3`,
+  `assemblyai>=0.45,<1`, `hume>=0.13.13,<1`. One rule for both pre- and
+  post-1.0 SDKs keeps the policy mechanical instead of requiring a judgment
+  call per package about how "volatile" its 0.x line is. An uncapped
+  third-party dep lets a vendor's major release break a clean `pip install`
+  at resolve time with no code change on our side — this is the exact class
+  of bug that broke `genblaze-lmnt` and `genblaze-elevenlabs` (#166, #163).
+  Dev/test tooling extras (`pytest`, `ruff`, `mypy`, `deptry`, `hypothesis`,
+  `jsonschema`, etc., normally grouped under a `dev` or `testing` extra) are
+  exempt from this cap — they're never resolved into a production install,
+  so a future major there costs us a CI failure to fix, not a broken
+  consumer install.
+
+  When a connector's floor is already several majors behind the version it
+  actually resolves to today (a floor-staleness bug in its own right, not a
+  packaging-cap issue), cap one major past the version currently verified
+  to work rather than the floor's next major — capping tighter than what's
+  actually in use would make a fresh install worse, not safer.
+
 ## Pre-release checklist
 
 Before cutting a release, verify on `main`:
 
 1. **Versions are bumped.** Every package whose code changed since the
    last release has its `pyproject.toml` `version` updated. The umbrella
-   `libs/meta/pyproject.toml` is bumped to reflect this release.
+   `libs/meta/pyproject.toml` is bumped to reflect this release, along with
+   its (and `cli`'s) `genblaze-core`/`genblaze-s3`/connector-extra floors.
+   `python3 tools/prepare_release.py --check`/`--apply` automates this
+   step deterministically — see `.claude/skills/prepare-release/SKILL.md`
+   for the end-to-end driver.
 2. **CHANGELOG is cut.** The `[Unreleased]` section is empty; a new
    `## [X.Y.Z] - YYYY-MM-DD` section lists every package version change
-   under "Released package versions".
+   under "Released package versions" (the exact text `prepare_release.py`
+   emits). The section's intro must include the "wave vs. package version"
+   paragraph (see the `## [0.7.0]` entry for the current wording) — the
+   GitHub Release body is generated verbatim from this slice (see below), so
+   this is the only place that warning needs to be written for *release
+   notes*; the root `README.md` and `libs/meta/README.md` carry their own
+   copies for readers who never open a release page.
 3. **TS types are current.** `make ts-types` produces no diff. (CI's
    `ts-types-check` job already enforces this on every push, but the
    release workflow re-runs it as a defense in depth.)
@@ -81,7 +121,20 @@ Triggered two ways:
    git push origin v0.3.0
    ```
 2. Create a GitHub Release on that tag. Paste the CHANGELOG slice for
-   this version as the body.
+   this version as the body — **do not** use `gh release create --notes-from-tag`;
+   it repeats the annotated tag's one-line message (`Release 0.3.0`) instead of
+   the CHANGELOG content, which is how v0.5.0 and v0.6.0 originally shipped
+   with just the tag message as their entire body (#250). Extract the slice
+   and pass it via `--notes-file`:
+   ```bash
+   awk '/^## \[0.3.0\]/{p=1} p&&/^## \[/&&!/^## \[0.3.0\]/{exit} p' CHANGELOG.md \
+     > /tmp/release-notes-0.3.0.md
+   if test -s /tmp/release-notes-0.3.0.md; then
+     gh release create v0.3.0 --title "0.3.0" --notes-file /tmp/release-notes-0.3.0.md
+   else
+     echo "empty slice — check the wave heading; release NOT created" >&2
+   fi
+   ```
 3. Publishing the Release fires the `Release` workflow.
 
 The workflow then runs:
@@ -117,9 +170,9 @@ Notes on the graph:
   per-package versions + `dry_run` flag to every downstream job.
 * **`changelog-gate`** — fails if `[Unreleased]` still has entries.
 * **`release-smoke`** — runs `make release-smoke`: builds every wheel,
-  installs `genblaze[all]` from a local wheelhouse with `--no-index`,
-  imports every connector. Catches version-pin mismatches before PyPI
-  sees them.
+  installs local genblaze wheels while leaving public PyPI enabled for
+  transitive dependencies, then imports every connector. Catches version-pin
+  mismatches before PyPI sees them.
 * **`pin-parity`** — for every package, compares source
   `[project.dependencies]` **and** `[project.optional-dependencies]`
   against the wheel already on PyPI at the same version. Fails the
@@ -148,12 +201,13 @@ Notes on the graph:
 * **`publish-npm`** — independent of the PyPI graph. Publishes
   `@genblaze/spec` with sigstore provenance.
 * **`install-verify`** — installs `genblaze[all]==$version` from public
-  PyPI in a fresh venv and imports the core packages. The `[all]` form
-  exercises every connector's pin against the live registry, which is
-  what catches drift like the 0.3.2 langsmith/cli wheels (a bare
-  `genblaze==$version` resolve only pulls the umbrella defaults and
-  misses connector-specific pin breakage). Skipped on dry-runs
-  (TestPyPI indexing lag makes this flaky).
+  PyPI in a fresh venv and runs `tools/release_import_smoke.py`, which
+  imports the umbrella, core, s3, and every connector in `genblaze[all]`.
+  The `[all]` form exercises every connector's pin and import surface
+  against the live registry, which is what catches drift like the 0.3.2
+  langsmith/cli wheels (a bare `genblaze==$version` resolve only pulls
+  the umbrella defaults and misses connector-specific pin breakage).
+  Skipped on dry-runs (TestPyPI indexing lag makes this flaky).
 
 ### 2. Dry run (`workflow_dispatch`)
 
@@ -247,11 +301,14 @@ production releases (recommended once the project graduates from alpha).
 * **The umbrella is the long pole.** If `publish-meta` fails, users
   cannot `pip install genblaze` — but they can still install individual
   packages. Treat a meta failure as a P0.
-* **install-verify is best-effort.** PyPI's CDN sometimes lags; the job
-  retries for 2 minutes before failing. A red `install-verify` after a
-  green publish graph usually means the package is fine and the index
-  is just behind — verify manually with `pip install genblaze==X.Y.Z`
-  in a fresh venv before assuming a regression.
+* **install-verify is best-effort.** PyPI's CDN sometimes lags. The
+  umbrella pre-check retries for 2 minutes before failing, and the
+  `genblaze[all]` install itself retries up to 5 times (30s apart) since
+  any of its ~14 connector packages can propagate independently of the
+  umbrella (#189). A red `install-verify` after a green publish graph
+  usually means a package is fine and the index is just behind — verify
+  manually with `pip install "genblaze[all]==X.Y.Z"` in a fresh venv
+  before assuming a regression.
 
 ## Post-publish verification
 
@@ -267,9 +324,10 @@ make post-release VERSION=0.4.0
 `VERSION` is the **umbrella** version from `libs/meta/pyproject.toml`,
 not the wave name (e.g. wave 0.3.0 shipped umbrella 0.4.0). The target
 creates a throwaway venv in `/tmp`, installs `genblaze[all]==$VERSION`
-from public PyPI, imports `genblaze_core` and `genblaze_s3`, and prints
-the installed versions of each. On failure the venv is left in place
-so you can re-run the failing command interactively.
+from public PyPI, imports the umbrella, core, s3, and every connector in
+`genblaze[all]`, then prints the installed versions of the umbrella/core/s3
+packages. On failure the venv is left in place so you can re-run the failing
+command interactively.
 
 This is the same check that caught the 0.3.0 `genblaze-s3` dependency-
 pin drift after `install-verify` lagged — it's a backstop, not

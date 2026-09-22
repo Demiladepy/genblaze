@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import socket
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
@@ -139,6 +139,28 @@ class TestBuildKey:
         )
         assert key == "assets/ab/cd/abcdef1234.png"
 
+    def test_content_addressable_normalizes_uppercase_extension(self):
+        """Byte-identical content with a differently-cased source extension
+        (e.g. .PNG vs .png) must dedup to the same CAS key — the extension
+        casing is an accident of the origin URL, not part of the content hash.
+        """
+        asset = Asset(url="https://x.com/IMG.PNG", media_type="image/png")
+        key_upper = _build_key(
+            KeyStrategy.CONTENT_ADDRESSABLE,
+            KeyBuilder.from_prefix("assets"),
+            asset,
+            "abcdef1234",
+            ".PNG",
+        )
+        key_lower = _build_key(
+            KeyStrategy.CONTENT_ADDRESSABLE,
+            KeyBuilder.from_prefix("assets"),
+            asset,
+            "abcdef1234",
+            ".png",
+        )
+        assert key_upper == key_lower == "assets/ab/cd/abcdef1234.png"
+
     def test_hierarchical(self):
         asset = Asset(url="https://x.com/img.png", media_type="image/png")
         key = _build_key(
@@ -171,6 +193,23 @@ class TestBuildKey:
         )
         assert key == f"pfx/2026-03-11/run-123/assets/{asset.asset_id}.png"
         assert "None" not in key
+
+    def test_hierarchical_preserves_extension_case(self):
+        """HIERARCHICAL keys are asset_id-based, not content-hash-based, so
+        there's no dedup collision to fix — extension casing is left as-is.
+        """
+        asset = Asset(url="https://x.com/IMG.PNG", media_type="image/png")
+        key = _build_key(
+            KeyStrategy.HIERARCHICAL,
+            KeyBuilder.from_prefix("assets"),
+            asset,
+            "abcdef1234",
+            ".PNG",
+            tenant=None,
+            date_str="2026-03-11",
+            run_id="run-123",
+        )
+        assert key == f"assets/2026-03-11/run-123/assets/{asset.asset_id}.PNG"
 
 
 class TestAssetTransfer:
@@ -236,6 +275,47 @@ class TestAssetTransfer:
 
         transfer.transfer(asset2)
         assert len(put_called) == 0  # Should have skipped
+
+    @patch("genblaze_core._utils.socket.getaddrinfo", return_value=_FAKE_ADDRINFO)
+    @patch("genblaze_core.storage.transfer._http_get_stream")
+    def test_content_addressable_dedup_ignores_extension_case(self, mock_urlopen, _mock_dns):
+        """End-to-end regression test for #20: byte-identical content fetched
+        via a differently-cased source extension (.PNG vs .png) must dedup —
+        the second transfer skips the upload rather than storing a duplicate.
+        """
+        mock_resp = MagicMock()
+        mock_resp.read.side_effect = [b"data", b""]
+        mock_resp.headers = {"Content-Type": "image/png"}
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        backend = FakeBackend()
+        transfer = AssetTransfer(backend, prefix="assets")
+
+        # First transfer via an upper-case extension.
+        asset = Asset(url="https://cdn.example.com/IMG.PNG", media_type="image/png")
+        key = transfer.transfer(asset)
+        assert key in backend.store
+
+        # Second transfer, same bytes, lower-case extension — must resolve to
+        # the same CAS key and skip the upload (dedup hit).
+        mock_resp.read.side_effect = [b"data", b""]
+        mock_urlopen.return_value = mock_resp
+        asset2 = Asset(url="https://cdn.example.com/img.png", media_type="image/png")
+
+        original_put = backend.put
+        put_called = []
+
+        def tracking_put(*args, **kwargs):
+            put_called.append(True)
+            return original_put(*args, **kwargs)
+
+        backend.put = tracking_put
+
+        key2 = transfer.transfer(asset2)
+        assert key2 == key
+        assert len(put_called) == 0  # Should have skipped — dedup hit
 
     def test_http_url_rejected(self):
         transfer, _ = self._make_transfer()
@@ -381,6 +461,44 @@ class TestReadLocalFile:
         missing = tmp_path / "nope.png"
         with pytest.raises(StorageError, match="Failed to read"):
             _read_local_file(f"file://{missing}")
+
+    def test_windows_drive_letter_file_url(self, tmp_path, monkeypatch):
+        """Regression for #132/#164: file:///C:/path yields /C:/path from
+        urlparse.path. The old unquote() kept the leading slash, causing
+        Path.resolve() to produce a drive-relative path on Windows that
+        failed the allowlist check. url2pathname() strips the leading slash
+        before the drive letter.
+
+        The input URL is built with PureWindowsPath.as_uri() — the exact
+        form local_file_url() (the shared helper every connector now calls)
+        produces for a Windows path — so this test proves the connector ->
+        sink contract holds, not just an arbitrary hardcoded string.
+
+        url2pathname is monkeypatched to return the pre-computed real_path
+        because a genuine Windows path string ("C:\\tmp\\asset.mp4") can't
+        round-trip through POSIX pathlib.Path.resolve() on this host; the
+        actual Windows parser (nturl2path.url2pathname) is exercised
+        unmocked in test_utils.py::TestLocalFileUrl.
+        """
+        test_file = tmp_path / "asset.mp4"
+        test_file.write_bytes(b"video data")
+        real_path = str(test_file.resolve())
+        win_url = PureWindowsPath(r"C:\tmp\asset.mp4").as_uri()
+        assert win_url == "file:///C:/tmp/asset.mp4"
+
+        # Simulate what Windows url2pathname does: /C:/tmp/asset.mp4 → C:\tmp\asset.mp4
+        # On the fix branch url2pathname is a module-level name we can monkeypatch.
+        monkeypatch.setattr(
+            "genblaze_core.storage.transfer.url2pathname",
+            lambda _: real_path,
+        )
+        monkeypatch.setattr(
+            "genblaze_core.storage.transfer.ALLOWED_FILE_ROOTS",
+            (tmp_path.resolve(),),
+        )
+
+        data, _ = _read_local_file(win_url)
+        assert data == b"video data"
 
 
 class TestConnectionLifecycle:
